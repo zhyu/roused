@@ -4,3 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-trait = "0.1.89"
+bytes = "1.12.1"
+env_logger = { version = "0.11.11", default-features = false }
+http = "1.4.0"
+log = "0.4.29"
+pingora = { version = "=0.8.1", default-features = false, features = ["proxy"] }
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.0.6"
+
+[dev-dependencies]
+tempfile = "3.27.0"

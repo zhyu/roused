@@ -12,9 +12,10 @@ authentication owned by upstream services.
 
 ## Current status
 
-This repository contains only the clean Rust scaffold and the design handoff.
-No product implementation has begun. The next task is **Milestone 1: Proxy**;
-it must stop before any launchd wake/sleep work.
+Milestone 1 is the plain HTTP reverse proxy for already-running loopback
+services. It does not invoke launchd, check readiness, or implement wake,
+loading, idle, or stop behavior. Lifecycle configuration fields are parsed for
+format stability but are otherwise inactive.
 
 Read these before changing code:
 
@@ -48,3 +49,25 @@ cargo test --locked --all-targets
 
 Milestone-specific integration tests are defined in
 [`docs/mvp-plan.md`](./docs/mvp-plan.md).
+
+## Run the Milestone 1 proxy
+
+Pass exactly one static TOML configuration path:
+
+```sh
+cargo run --locked -- /absolute/path/to/roused.toml
+```
+
+The file uses the configuration shape in [`docs/design.md`](./docs/design.md).
+Roused validates the complete file before binding its configured listener. An
+unconfigured or malformed request `Host` receives this deterministic response:
+
+- status: `421 Misdirected Request`
+- `Content-Type: text/plain; charset=utf-8`
+- `Cache-Control: no-store`
+- body: `unknown host\n`
+
+Logging is capped at INFO and does not include request or response headers.
+Dependency DEBUG/TRACE logging is unsupported because it can expose those
+headers. Plain HTTP credentials remain unencrypted on the network, and Roused
+preserves (rather than weakens) upstream `Secure` cookie attributes.
