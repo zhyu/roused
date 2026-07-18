@@ -654,10 +654,13 @@ fn cookie_websocket_echo_survives_more_than_sixty_idle_seconds() {
     });
 
     let fixture_address = websocket_fixture.address();
-    let proxy = ProxyProcess::spawn(|listen| {
-        proxy_configuration(
-            listen,
-            &[("ws.apps.test", fixture_address, "net.test.websocket")],
+    let launchd_label = format!(
+        "com.openai.roused.test.websocket.{}",
+        runtime_token("lease")
+    );
+    let proxy = ProxyProcess::spawn_with_stderr_capture(move |listen| {
+        format!(
+            "listen = \"{listen}\"\n\n[[services]]\nhost = \"ws.apps.test\"\nupstream = \"{fixture_address}\"\nlaunchd_label = \"{launchd_label}\"\nidle_timeout_seconds = 1\n"
         )
     });
     let original_host = format!("Ws.ApPs.TeSt.:{}", proxy.address().port());
@@ -701,6 +704,10 @@ fn cookie_websocket_echo_survives_more_than_sixty_idle_seconds() {
     let idle_started = Instant::now();
     thread::sleep(Duration::from_secs(61));
     assert!(idle_started.elapsed() > Duration::from_secs(60));
+    assert!(
+        !proxy.stderr_contents().contains("launchctl stop started"),
+        "an open WebSocket lease allowed an idle stop"
+    );
     write_websocket_frame(
         &mut client,
         0x1,
@@ -718,6 +725,10 @@ fn cookie_websocket_echo_survives_more_than_sixty_idle_seconds() {
         Some([0x91, 0xa3, 0xb5, 0xc7]),
     )
     .expect("close WebSocket");
+    let (opcode, _) = read_websocket_frame(&mut client).expect("read WebSocket close response");
+    assert_eq!(opcode, 0x8);
+    drop(client);
+    wait_for_proxy_log(&proxy, "launchctl stop started");
 }
 
 #[test]
@@ -881,6 +892,20 @@ fn contains_header_token(value: &str, expected: &str) -> bool {
     value
         .split(',')
         .any(|token| token.trim().eq_ignore_ascii_case(expected))
+}
+
+fn wait_for_proxy_log(proxy: &ProxyProcess, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if proxy.stderr_contents().contains(needle) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "proxy log did not contain {needle}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn write_websocket_frame(

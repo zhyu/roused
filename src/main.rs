@@ -1,5 +1,6 @@
 use pingora::server::Server;
 use pingora::server::configuration::ServerConf;
+use pingora::services::background::background_service;
 use roused::config::Config;
 use roused::proxy::RousedProxy;
 use std::env;
@@ -35,12 +36,14 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let listen = config.listen();
     let proxy = RousedProxy::new(&config);
+    let idle_monitor = background_service("idle shutdown", proxy.idle_monitor());
     let mut server = Server::new_with_opt_and_conf(None, server_config);
     server.bootstrap();
 
     let mut service = pingora::proxy::http_proxy_service(&server.configuration, proxy);
     service.add_tcp(&listen.to_string());
     server.add_service(service);
+    server.add_service(idle_monitor);
     server.run_forever();
 }
 

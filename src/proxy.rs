@@ -1,4 +1,5 @@
 use crate::config::{Config, normalize_request_host};
+use crate::lifecycle::{IdleMonitor, ServiceLease, ServiceLifecycle};
 use crate::wake::{WakeTarget, current_user_id};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -11,8 +12,8 @@ use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::prelude::{Error, HttpPeer, InternalError, Result};
 use pingora::proxy::{ProxyHttp, Session};
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 const UNKNOWN_HOST_BODY: &[u8] = b"unknown host\n";
 const LOADING_HTML_BODY: &[u8] = b"<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"5\"><title>Loading</title></head><body>Service is starting.</body></html>\n";
@@ -20,35 +21,59 @@ const LOADING_JSON_BODY: &[u8] = b"{\"status\":\"loading\",\"retry_after\":5}\n"
 
 pub struct RousedProxy {
     listener_port: u16,
-    routes: HashMap<String, Arc<WakeTarget>>,
+    routes: HashMap<String, Arc<ServiceRoute>>,
+    idle_monitor: IdleMonitor,
 }
 
 #[derive(Default)]
 pub struct RequestContext {
-    upstream: Option<SocketAddr>,
+    route: Option<Arc<ServiceRoute>>,
+    lease: Option<ServiceLease>,
     websocket: bool,
+}
+
+struct ServiceRoute {
+    wake: Arc<WakeTarget>,
+    lifecycle: Arc<ServiceLifecycle>,
 }
 
 impl RousedProxy {
     pub fn new(config: &Config) -> Self {
         let user_id = current_user_id();
+        let mut lifecycles = Vec::new();
         let routes = config
             .services()
             .map(|service| {
+                let wake = WakeTarget::new(
+                    service.upstream(),
+                    service.launchd_label().to_owned(),
+                    user_id,
+                );
+                let lifecycle = ServiceLifecycle::new(
+                    service.launchd_label().to_owned(),
+                    user_id,
+                    Duration::from_secs(service.idle_timeout_seconds()),
+                    service.can_stop_command().map(<[String]>::to_vec),
+                    Arc::clone(&wake),
+                );
+                lifecycles.push(Arc::clone(&lifecycle));
                 (
                     service.host().to_owned(),
-                    WakeTarget::new(
-                        service.upstream(),
-                        service.launchd_label().to_owned(),
-                        user_id,
-                    ),
+                    Arc::new(ServiceRoute { wake, lifecycle }),
                 )
             })
             .collect();
         Self {
             listener_port: config.listen().port(),
             routes,
+            idle_monitor: IdleMonitor::new(lifecycles),
         }
+    }
+
+    pub fn idle_monitor(
+        &self,
+    ) -> impl pingora::services::background::BackgroundService + Clone + use<> {
+        self.idle_monitor.clone()
     }
 }
 
@@ -74,14 +99,33 @@ impl ProxyHttp for RousedProxy {
             write_unknown_host(session).await?;
             return Ok(true);
         };
-        context.upstream = Some(route.upstream());
+        route.lifecycle.note_request_arrival();
 
-        if route.is_ready().await {
+        if route.wake.is_ready().await {
+            context.route = Some(route);
             return Ok(false);
         }
 
-        route.request_launch();
+        route.wake.request_launch();
         write_loading_response(session).await?;
+        Ok(true)
+    }
+
+    async fn proxy_upstream_filter(
+        &self,
+        _session: &mut Session,
+        context: &mut Self::CTX,
+    ) -> Result<bool> {
+        let route = context.route.as_ref().ok_or_else(|| {
+            Error::explain(InternalError, "route missing before upstream proxying")
+        })?;
+        if context.lease.is_some() {
+            return Err(Error::explain(
+                InternalError,
+                "service lease acquired more than once",
+            ));
+        }
+        context.lease = Some(route.lifecycle.acquire());
         Ok(true)
     }
 
@@ -90,9 +134,13 @@ impl ProxyHttp for RousedProxy {
         _session: &mut Session,
         context: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let upstream = context.upstream.ok_or_else(|| {
-            Error::explain(InternalError, "route missing after request filtering")
-        })?;
+        let upstream = context
+            .route
+            .as_ref()
+            .map(|route| route.wake.upstream())
+            .ok_or_else(|| {
+                Error::explain(InternalError, "route missing after request filtering")
+            })?;
         Ok(Box::new(HttpPeer::new(upstream, false, String::new())))
     }
 
@@ -124,6 +172,15 @@ impl ProxyHttp for RousedProxy {
             session.as_downstream_mut().set_read_timeout(None);
         }
         Ok(())
+    }
+
+    async fn logging(
+        &self,
+        _session: &mut Session,
+        _error: Option<&Error>,
+        context: &mut Self::CTX,
+    ) {
+        drop(context.lease.take());
     }
 
     fn request_summary(&self, _session: &Session, _context: &Self::CTX) -> String {

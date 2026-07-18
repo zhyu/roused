@@ -90,6 +90,11 @@ impl WakeTarget {
         self.request_launch_at(Instant::now());
     }
 
+    pub(crate) fn allow_launch_after_stop(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        *state = LaunchState::Eligible;
+    }
+
     fn request_launch_at(self: &Arc<Self>, now: Instant) {
         let should_start = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -263,6 +268,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn intentional_stop_makes_the_next_wake_immediately_eligible() {
+        let launcher = Arc::new(CountingLauncher::default());
+        let target = WakeTarget::with_launcher(
+            "127.0.0.1:19001".parse().unwrap(),
+            "net.test.wake".to_owned(),
+            501,
+            launcher.clone(),
+        );
+        target.request_launch();
+        assert_eq!(launcher.calls.load(Ordering::SeqCst), 1);
+        target.launch_finished_at(Instant::now());
+
+        target.allow_launch_after_stop();
+        target.request_launch();
+        assert_eq!(launcher.calls.load(Ordering::SeqCst), 2);
+    }
+
     #[tokio::test]
     async fn bounded_command_reports_failure_and_timeout() {
         let failed = run_bounded_command(CommandSpec {
@@ -289,6 +312,10 @@ mod tests {
         let target = WakeTarget::new(address, "net.test.ready".to_owned(), 501);
         assert!(target.is_ready().await);
         drop(listener);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while target.is_ready().await && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(!target.is_ready().await);
     }
 }

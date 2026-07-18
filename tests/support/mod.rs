@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -99,18 +100,26 @@ pub struct ProxyProcess {
 
 impl ProxyProcess {
     pub fn spawn(make_configuration: impl FnOnce(SocketAddr) -> String) -> Self {
-        Self::spawn_inner(make_configuration, false)
+        Self::spawn_inner(make_configuration, false, Vec::new())
     }
 
     pub fn spawn_with_stderr_capture(
         make_configuration: impl FnOnce(SocketAddr) -> String,
     ) -> Self {
-        Self::spawn_inner(make_configuration, true)
+        Self::spawn_inner(make_configuration, true, Vec::new())
+    }
+
+    pub fn spawn_with_stderr_capture_and_environment(
+        make_configuration: impl FnOnce(SocketAddr) -> String,
+        environment: Vec<(OsString, OsString)>,
+    ) -> Self {
+        Self::spawn_inner(make_configuration, true, environment)
     }
 
     fn spawn_inner(
         make_configuration: impl FnOnce(SocketAddr) -> String,
         capture_stderr: bool,
+        environment: Vec<(OsString, OsString)>,
     ) -> Self {
         let address = unused_loopback_address();
         let configuration = make_configuration(address);
@@ -126,6 +135,7 @@ impl ProxyProcess {
 
         let mut child = Command::new(env!("CARGO_BIN_EXE_roused"))
             .arg(configuration_path)
+            .envs(environment)
             .stdout(Stdio::null())
             .stderr(stderr)
             .spawn()
