@@ -1,45 +1,67 @@
 # Roused
 
-Roused is a macOS activation reverse proxy for lightly used home-server web
-services. It routes plain HTTP/1.1 requests by hostname, wakes an existing
-current-user LaunchAgent when needed, proxies the service while it is active,
-and stops it after a safe idle period.
+Roused is a macOS activation reverse proxy for lightly used web services. It
+routes plain HTTP/1.1 requests by hostname, wakes an existing current-user
+LaunchAgent when its service is unavailable, proxies requests while the service
+is running, and requests shutdown after the service has been idle long enough.
 
-The three planned milestones are complete. This is the complete bounded MVP;
-there is no Milestone 4.
+The bounded MVP is implemented and usable. It is intentionally designed for a
+trusted private network on one macOS host; it does not provide TLS or gateway
+authentication.
 
-Read these before changing code:
+## How it works
 
-- [`AGENTS.md`](./AGENTS.md) — repository working rules and scope controls.
-- [`docs/design.md`](./docs/design.md) — stable product and protocol decisions.
-- [`docs/mvp-plan.md`](./docs/mvp-plan.md) — the three bounded milestones and
-  their acceptance criteria.
+1. A client sends a request to a configured hostname on the Roused listener.
+2. If the target's loopback port is ready, Roused proxies the request
+   immediately.
+3. If the target is not ready, Roused asks launchd to start its already-loaded
+   current-user LaunchAgent and returns a temporary `503`. The client retries
+   later; Roused never replays the original request.
+4. Proxied requests keep the target active until their uploads, responses, or
+   WebSocket connections finish.
+5. Once the target is idle, an optional external check may veto shutdown.
+   Otherwise Roused asks launchd to deliver `SIGTERM`.
 
-## Build and run
+## Requirements and security warning
 
-Roused targets macOS and uses Rust with exactly Pingora 0.8.1. Build the
-committed dependency graph and run the foreground gateway with one static TOML
-path:
+- macOS with a logged-in GUI user session;
+- Rust/Cargo with Rust 2024 edition support and CMake to build Roused;
+- target services already defined as current-user LaunchAgents; and
+- DNS or client host configuration that points each configured hostname to the
+  Mac running Roused.
+
+Roused serves unencrypted HTTP and has no authentication layer of its own.
+Basic, Bearer, cookie, and body-token credentials pass through to the upstream
+in cleartext on the network. Use it only on a deliberately trusted private
+network and never expose it directly to the public internet.
+
+## Quick start
+
+Build the committed dependency graph:
 
 ```sh
 cargo build --locked --release
-./target/release/roused /absolute/path/to/roused.toml
 ```
 
-For a development build, the equivalent command is:
+Prepare the target service as a current-user LaunchAgent. The supplied template
+is a starting point, not an installer:
 
 ```sh
-cargo run --locked -- /absolute/path/to/roused.toml
+cp packaging/launchd/roused-target.plist \
+  "$HOME/Library/LaunchAgents/net.example.service.plist"
+# Edit the copy: set its label and absolute executable/argument paths.
+/usr/bin/plutil -lint \
+  "$HOME/Library/LaunchAgents/net.example.service.plist"
+/bin/launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/net.example.service.plist"
 ```
 
-CMake is needed to build Pingora's native dependencies, but is not needed
-merely to run the resulting executable. The recorded discovery baseline was
-macOS arm64, Rust/Cargo 1.97.1, and CMake 4.4.0; it is not an upgrade request.
+The target must use `RunAtLoad=false` and `KeepAlive=false`, listen on the
+configured loopback address, and have a `Label` equal to `launchd_label` in the
+Roused configuration. Bootstrapping loads its definition without starting it.
+If the target is already correctly bootstrapped, do not bootstrap it again.
 
-Roused validates the entire configuration before binding the listener. The
-configuration is not reloaded while the process is running.
-
-## Static configuration
+Create a configuration file such as `roused.toml`:
 
 ```toml
 listen = "0.0.0.0:8080"
@@ -52,195 +74,185 @@ idle_timeout_seconds = 1800
 can_stop_command = ["/absolute/path/to/can-stop", "--literal-argument"]
 ```
 
-`listen` must be a fixed unprivileged address. Each service maps one DNS host
-to a distinct loopback HTTP upstream and current-user launchd label.
-`idle_timeout_seconds` defaults to 1,800 and must be nonzero.
-`can_stop_command` is optional. Unknown fields, duplicate normalized hosts,
-labels or upstreams, non-loopback upstreams, invalid labels, and malformed
-stop commands reject the complete configuration before listening.
+`0.0.0.0` accepts cleartext connections on every IPv4 interface. Use
+`127.0.0.1` instead if only local clients should reach the gateway.
 
-Every target must already be configured and bootstrapped as a LaunchAgent in
-`gui/$UID`. Its `Label` must equal `launchd_label`, it must listen on the
-configured loopback `upstream`, and it must use `RunAtLoad=false` and
-`KeepAlive=false`. Roused consumes labels only: it never installs, edits,
-discovers, inspects, repairs, or accepts the path of a target plist.
-
-## Current-user LaunchAgent templates
-
-The templates in [`packaging/launchd`](./packaging/launchd) are starting
-points, not an installer:
-
-- [`roused-gateway.plist`](./packaging/launchd/roused-gateway.plist) has
-  `RunAtLoad=true` and `KeepAlive=true`.
-- [`roused-target.plist`](./packaging/launchd/roused-target.plist) has
-  `RunAtLoad=false` and `KeepAlive=false`.
-
-Copy each template to the current user's `~/Library/LaunchAgents`, replace its
-example label and every `/ABSOLUTE/PATH/...` value, and validate it before
-bootstrap. launchd does not perform shell, variable, or `~` expansion inside
-`ProgramArguments`; the executable and configuration paths must be absolute,
-and each argument is a separate array element.
-
-For a target that is not already bootstrapped:
+Run Roused in the foreground:
 
 ```sh
-cp packaging/launchd/roused-target.plist \
-  "$HOME/Library/LaunchAgents/net.example.service.plist"
-# Edit the copy, then check that Label matches launchd_label in roused.toml.
-/usr/bin/plutil -lint \
-  "$HOME/Library/LaunchAgents/net.example.service.plist"
-/bin/launchctl bootstrap "gui/$(id -u)" \
-  "$HOME/Library/LaunchAgents/net.example.service.plist"
+./target/release/roused /absolute/path/to/roused.toml
 ```
 
-Bootstrap loads the target definition but does not start it. Roused later
-uses the configured label to start it.
+Roused validates the complete configuration before it binds the listener. It
+has no validation-only command and does not reload configuration at runtime.
 
-Install the gateway after building the release executable and validating its
-configuration interactively:
+For a local smoke test without changing DNS:
 
 ```sh
-cp packaging/launchd/roused-gateway.plist \
-  "$HOME/Library/LaunchAgents/net.example.roused.plist"
-# Edit the copy to contain the absolute release-binary and TOML paths.
-/usr/bin/plutil -lint \
-  "$HOME/Library/LaunchAgents/net.example.roused.plist"
-/bin/launchctl bootstrap "gui/$(id -u)" \
-  "$HOME/Library/LaunchAgents/net.example.roused.plist"
+curl -i --resolve service.apps.home.arpa:8080:127.0.0.1 \
+  http://service.apps.home.arpa:8080/
 ```
 
-`RunAtLoad` starts the gateway and `KeepAlive` restarts it if it exits. To
-unload the example jobs, address only their current-user service targets:
+A stopped target normally makes the first request return `503 Service
+Unavailable` with `Retry-After: 5`. Retry after the target begins listening;
+the later request should reach the service. Roused configures routing only—it
+does not create DNS records.
 
-```sh
-/bin/launchctl bootout "gui/$(id -u)/net.example.roused"
-/bin/launchctl bootout "gui/$(id -u)/net.example.service"
+## Configuration reference
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `listen` | yes | Literal IP socket for the gateway, using port 1024 or higher. |
+| `services[].host` | yes | ASCII DNS hostname without a port. Matching is case-insensitive and accepts one terminal dot or the configured listener port on requests. |
+| `services[].upstream` | yes | Literal loopback IP socket with a nonzero port. |
+| `services[].launchd_label` | yes | Label of an already-bootstrapped job in `gui/$UID`. |
+| `services[].idle_timeout_seconds` | no | Nonzero idle interval; defaults to 1,800 seconds. |
+| `services[].can_stop_command` | no | Nonempty direct argv. The executable in element zero must be an absolute path. |
+
+At least one service is required. Normalized hosts, upstreams, and launchd
+labels must be unique. Unknown fields and any invalid entry reject the entire
+configuration.
+
+Roused accepts launchd labels, never plist paths. Startup validation does not
+inspect a target's plist or prove that its job exists. A missing label, a job
+that was not bootstrapped, or a service listening at the wrong address becomes
+visible when wake attempts fail and clients continue receiving `503` responses.
+
+## Request and wake behavior
+
+Roused routes the HTTP `Host` header. A malformed or unconfigured host receives:
+
+- `421 Misdirected Request`;
+- `Content-Type: text/plain; charset=utf-8`;
+- `Cache-Control: no-store`; and
+- body `unknown host\n`.
+
+For a ready service, Roused preserves methods, paths and queries, the original
+`Host`, request and response streaming, upstream-owned authentication and
+cookies, repeated response fields, and valid WebSocket upgrades. It removes
+`Proxy-Authorization` and the bounded hop-by-hop headers described in
+[`docs/design.md`](./docs/design.md). Each request gets only one total upstream
+attempt, so a POST is never automatically resubmitted.
+
+For an unavailable service, Roused performs a short loopback readiness check
+and deduplicates:
+
+```text
+/bin/launchctl kickstart gui/$UID/<launchd_label>
 ```
 
-These operations require neither `sudo` nor a write under `/Library`. Roused
-does not support a system LaunchDaemon, root operation, or pre-login service.
+The launch command has a five-second timeout and a five-second retry cooldown.
+An explicitly HTML-accepting GET or HEAD receives a small loading page; every
+other cold request receives JSON. Both responses are `503`, carry
+`Retry-After: 5` and `Cache-Control: no-store`, and close the downstream
+connection. The cold request body is neither buffered nor replayed.
 
-## Request and lifecycle behavior
+## Idle and stop behavior
 
-For each configured request, Roused first checks whether the loopback upstream
-accepts TCP connections. A ready service is proxied immediately, including a
-service that was already running when the gateway started; no kickstart is
-issued. Proxying preserves upstream-owned authentication, cookies, challenges,
-repeated response fields, request and response streaming, and WebSocket
-upgrades, while permitting only one total upstream attempt.
+Only a request that reaches a ready upstream holds a service lease. The lease
+lasts through the full upload and response, a disconnect or fatal error, and a
+WebSocket upgrade until that socket closes. Cold and unknown-host responses do
+not hold leases.
 
-If the upstream is not ready, Roused deduplicates
-`/bin/launchctl kickstart gui/$UID/<launchd_label>` attempts. The cold request
-is never buffered or replayed. Safe HTML GET or HEAD navigation receives a
-small no-store `503` loading page; other requests receive a no-store JSON
-`503`. Both carry `Retry-After: 5`, and a connection with an unread cold body
-is not reused. A later client request is proxied once readiness succeeds.
+For proxied work, the idle interval begins when the most recent request
+completes. A configured request arrival also advances the grace period and
+invalidates an obsolete pending stop decision. Shutdown is considered only
+when no request is in flight. Each service receives a fresh idle grace period
+when the gateway starts; lifecycle state is not persisted.
 
-An unknown or malformed `Host` receives this deterministic response:
+When `can_stop_command` is configured, Roused executes it directly without a
+shell. Arguments are literal, and stdin, stdout, and stderr are discarded. Use
+absolute paths for executables and any file arguments, especially when Roused
+runs under launchd. Only exit status 0 permits shutdown. Failure, a nonzero
+status, or the fixed five-second timeout keeps the target running; while it
+remains idle, another check runs no sooner than 30 seconds later.
 
-- status: `421 Misdirected Request`
-- `Content-Type: text/plain; charset=utf-8`
-- `Cache-Control: no-store`
-- body: `unknown host\n`
-
-Only a ready service request that will actually be proxied acquires a service
-lease. Loading and unknown-host responses do not. The lease covers the full
-upload and response body and remains held until response EOF, a fatal error,
-client disconnect, or an upgraded WebSocket closing. Long uploads, downloads,
-responses, and WebSockets therefore prevent shutdown while active.
-
-Releasing the lease records the last completed activity and advances that
-service's idle generation. Roused considers a stop only after the configured
-idle interval has elapsed since the last completed proxied request and the
-service has no in-flight requests. A wake request or newly proxied request
-invalidates an obsolete pending stop.
-
-Each service's idle clock starts at the current time when the gateway starts.
-Lifecycle state is not persisted. An already-running target consequently gets
-a fresh idle grace period after a gateway start or restart and remains
-immediately reachable without a new kickstart.
-
-## External stop checks and shutdown
-
-When `can_stop_command` is configured, Roused executes its first element as
-the executable and passes the remaining elements as literal argv using Rust's
-direct `Command` interface. It never invokes a shell: expansion, quoting,
-pipelines, redirection, and shell operators are not interpreted. The
-executable must be an absolute path.
-
-The command has a fixed five-second timeout. Only exit status 0 permits a
-stop. A nonzero exit, timeout, missing executable, spawn error, or any other
-execution failure conservatively keeps the target running. While the service
-otherwise remains idle, a vetoed or failed check is retried no more often than
-once every 30 seconds. With no configured check, the in-flight and idle rules
-alone permit stopping. Checker argv is never logged.
-
-After a successful check, Roused atomically rechecks the service's in-flight
-count and idle generation. Activity that arrived while the check ran cancels
-that stop attempt. If the recheck still permits shutdown, Roused makes the
+After an allowed check and an atomic activity recheck, Roused makes this
 best-effort call:
 
 ```text
 /bin/launchctl kill SIGTERM gui/$UID/<launchd_label>
 ```
 
-This signals but does not unload the target LaunchAgent. With
-`KeepAlive=false`, the target remains stopped until a later request causes a
-new kickstart. There is no graceful-drain protocol, SIGKILL escalation, PID
-discovery, or restart-policy repair.
+This signals the job but does not unload it. If the target exits on `SIGTERM`
+and has `KeepAlive=false`, it remains stopped until a later request wakes it.
+Roused does not drain the target, escalate to `SIGKILL`, discover its PID, or
+repair its restart policy.
 
-The gateway template's `KeepAlive=true` makes launchd restart a killed
-gateway. Restarting the gateway does not restart an already-running target;
-the target is reached directly with a new in-memory idle grace period and no
-kickstart. No request, wake, idle, or stop-check state survives the restart.
+## Run Roused at login
 
-## Security limits
+After the foreground smoke test succeeds, install the gateway as another
+current-user LaunchAgent:
 
-Roused provides no gateway authentication and no TLS. Plain HTTP exposes
-Basic, Bearer, cookie, and body-token credentials in cleartext to the LAN, so
-the gateway is suitable only for a deliberately trusted private network and
-must not be exposed publicly.
+```sh
+cp packaging/launchd/roused-gateway.plist \
+  "$HOME/Library/LaunchAgents/net.example.roused.plist"
+# Edit the copy to use absolute paths to the release binary and TOML file.
+/usr/bin/plutil -lint \
+  "$HOME/Library/LaunchAgents/net.example.roused.plist"
+/bin/launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/net.example.roused.plist"
+```
 
-Roused preserves upstream `Secure` cookie attributes rather than weakening or
-rewriting them. Browsers generally will not store or send a `Secure` cookie
-over this cleartext HTTP gateway, so services that require HTTPS or Secure
-cookies are outside the MVP.
+The template uses `RunAtLoad=true` and `KeepAlive=true`, so launchd starts and
+restarts the gateway. Restarting Roused does not restart a target that is
+already listening; that target is proxied immediately and receives a fresh
+in-memory idle grace period.
 
-Supported logging is capped at INFO and does not include request headers,
-response headers, credentials, or checker argv. Enabling Pingora dependency
-DEBUG or TRACE logging is unsupported and risks exposing authentication and
-other header values.
+To unload the example jobs, address their current-user service targets:
 
-## Explicit MVP non-goals
+```sh
+/bin/launchctl bootout "gui/$(id -u)/net.example.roused"
+/bin/launchctl bootout "gui/$(id -u)/net.example.service"
+```
 
-The MVP intentionally does not include:
+None of these operations needs `sudo` or writes under `/Library`.
 
-- containers, Apple container support, direct child-process supervision, or
-  raw one-off-command execution;
-- installing, editing, discovering, inspecting, or repairing target plists;
-- native aria2 logic, an aria2-specific adapter or checker, generalized
-  health adapters, or other HTTP/JSON-RPC stop-check adapters (an operator's
-  external argv program may apply application-specific policy);
-- real aria2, removable-volume, TCC, or disk-throttling validation;
-- SSE support or investigation;
-- configuration reload, persistence, aliases, a dashboard, an admin API, or
-  metrics;
-- gateway authentication, TLS, certificate handling, public access, HTTP/2,
-  or HTTP/3;
-- rate limits, body-size or CORS policy, `Forwarded`/`X-Forwarded-*`
-  synthesis, or cookie and redirect rewriting;
-- graceful drain protocols, SIGKILL escalation, PID discovery, or target
-  restart-policy repair; or
-- broad launchd, security, performance, or proxy-conformance audits.
+## Troubleshooting
 
-There are no post-MVP milestones in this plan.
+| Symptom | Check |
+| --- | --- |
+| Repeated `503` responses | Confirm the target job is bootstrapped in `gui/$UID`, its label matches the configuration, and it listens on the configured loopback socket after kickstart. |
+| `421 Misdirected Request` | Confirm the request `Host` matches `services[].host`; an included port must equal the Roused listener port. |
+| A configuration edit has no effect | Restart Roused; configuration is loaded only at startup. |
+| A target never stops | Check for active requests or WebSockets, a vetoed/failed stop command, a target that ignores `SIGTERM`, or an incompatible launchd `KeepAlive` policy. |
 
-## Quality gates
+Roused logs service labels and lifecycle outcomes at INFO/WARN, but not request
+headers, response headers, credentials, or checker argv.
 
-The complete MVP is checked with:
+## Current limitations
+
+- macOS and current-user `gui/$UID` LaunchAgents only;
+- plain HTTP/1.1 only—no TLS, HTTP/2, HTTP/3, or public-access hardening;
+- no gateway authentication, rate limits, body-size policy, or CORS policy;
+- no configuration reload, persistent lifecycle state, host aliases,
+  dashboard, admin API, or metrics;
+- no target plist installation, discovery, inspection, editing, or repair;
+- no direct target-process supervision or arbitrary target command execution;
+- no `Forwarded`/`X-Forwarded-*` synthesis, cookie rewriting, or redirect
+  rewriting; and
+- no support guarantee for Server-Sent Events.
+
+Roused preserves upstream `Secure` cookie attributes. Browsers generally do
+not store or send those cookies over this cleartext gateway, so services that
+require HTTPS or `Secure` cookies are not compatible. Dependency DEBUG/TRACE
+logging is unsupported because it may expose authentication or other headers.
+
+## Development and verification
+
+Run the complete quality gates with:
 
 ```sh
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 ```
+
+The full test suite requires macOS and a logged-in GUI user domain. It uses
+uniquely labeled disposable current-user LaunchAgents and loopback fixtures;
+it does not operate existing user services. One WebSocket integration test
+intentionally runs for more than 60 seconds.
+
+[`docs/design.md`](./docs/design.md) is the durable technical contract. The
+[`docs/mvp-plan.md`](./docs/mvp-plan.md) file is retained as the historical
+delivery and acceptance record, not as an active roadmap.
