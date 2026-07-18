@@ -12,10 +12,10 @@ authentication owned by upstream services.
 
 ## Current status
 
-Milestone 1 is the plain HTTP reverse proxy for already-running loopback
-services. It does not invoke launchd, check readiness, or implement wake,
-loading, idle, or stop behavior. Lifecycle configuration fields are parsed for
-format stability but are otherwise inactive.
+Milestone 2 adds request-time loopback readiness checks, deduplicated wake-up
+of configured current-user LaunchAgents, and deterministic loading responses
+to the Milestone 1 reverse proxy. It does not implement idle accounting, stop
+checks, stopping, or gateway LaunchAgent packaging.
 
 Read these before changing code:
 
@@ -50,7 +50,7 @@ cargo test --locked --all-targets
 Milestone-specific integration tests are defined in
 [`docs/mvp-plan.md`](./docs/mvp-plan.md).
 
-## Run the Milestone 1 proxy
+## Run the Milestone 2 proxy
 
 Pass exactly one static TOML configuration path:
 

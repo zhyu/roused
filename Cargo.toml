@@ -8,9 +8,11 @@ async-trait = "0.1.89"
 bytes = "1.12.1"
 env_logger = { version = "0.11.11", default-features = false }
 http = "1.4.0"
+libc = "0.2.186"
 log = "0.4.29"
 pingora = { version = "=0.8.1", default-features = false, features = ["proxy"] }
 serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.53.0", features = ["macros", "net", "process", "rt", "time"] }
 toml = "1.0.6"
 
 [dev-dependencies]

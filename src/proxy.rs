@@ -1,22 +1,26 @@
 use crate::config::{Config, normalize_request_host};
+use crate::wake::{WakeTarget, current_user_id};
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::HeaderMap;
 use http::header::{
-    CONNECTION, CONTENT_LENGTH, HOST, HeaderName, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE,
-    TRAILER, TRANSFER_ENCODING, UPGRADE,
+    ACCEPT, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName,
+    PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, RETRY_AFTER, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
+use http::{HeaderMap, Method};
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::prelude::{Error, HttpPeer, InternalError, Result};
 use pingora::proxy::{ProxyHttp, Session};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 const UNKNOWN_HOST_BODY: &[u8] = b"unknown host\n";
+const LOADING_HTML_BODY: &[u8] = b"<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"5\"><title>Loading</title></head><body>Service is starting.</body></html>\n";
+const LOADING_JSON_BODY: &[u8] = b"{\"status\":\"loading\",\"retry_after\":5}\n";
 
 pub struct RousedProxy {
     listener_port: u16,
-    routes: HashMap<String, SocketAddr>,
+    routes: HashMap<String, Arc<WakeTarget>>,
 }
 
 #[derive(Default)]
@@ -27,9 +31,19 @@ pub struct RequestContext {
 
 impl RousedProxy {
     pub fn new(config: &Config) -> Self {
+        let user_id = current_user_id();
         let routes = config
             .services()
-            .map(|service| (service.host().to_owned(), service.upstream()))
+            .map(|service| {
+                (
+                    service.host().to_owned(),
+                    WakeTarget::new(
+                        service.upstream(),
+                        service.launchd_label().to_owned(),
+                        user_id,
+                    ),
+                )
+            })
             .collect();
         Self {
             listener_port: config.listen().port(),
@@ -48,19 +62,27 @@ impl ProxyHttp for RousedProxy {
 
     async fn request_filter(&self, session: &mut Session, context: &mut Self::CTX) -> Result<bool> {
         context.websocket = is_valid_websocket_request(session.req_header());
-        context.upstream = session
+        let route = session
             .req_header()
             .headers
             .get(HOST)
             .and_then(|host| host.to_str().ok())
             .and_then(|host| normalize_request_host(host, self.listener_port))
-            .and_then(|host| self.routes.get(&host).copied());
+            .and_then(|host| self.routes.get(&host).cloned());
 
-        if context.upstream.is_none() {
+        let Some(route) = route else {
             write_unknown_host(session).await?;
             return Ok(true);
+        };
+        context.upstream = Some(route.upstream());
+
+        if route.is_ready().await {
+            return Ok(false);
         }
-        Ok(false)
+
+        route.request_launch();
+        write_loading_response(session).await?;
+        Ok(true)
     }
 
     async fn upstream_peer(
@@ -125,6 +147,70 @@ async fn write_unknown_host(session: &mut Session) -> Result<()> {
     session
         .write_response_body(Some(Bytes::from_static(UNKNOWN_HOST_BODY)), true)
         .await
+}
+
+async fn write_loading_response(session: &mut Session) -> Result<()> {
+    let html = prefers_html_loading(session.req_header());
+    let head = session.req_header().method == Method::HEAD;
+    let (content_type, body) = if html {
+        ("text/html; charset=utf-8", LOADING_HTML_BODY)
+    } else {
+        ("application/json", LOADING_JSON_BODY)
+    };
+
+    let mut response = ResponseHeader::build(503, Some(5))?;
+    response.insert_header(CONTENT_TYPE, content_type)?;
+    response.insert_header(RETRY_AFTER, "5")?;
+    response.insert_header(CACHE_CONTROL, "no-store")?;
+    response.insert_header(CONTENT_LENGTH, body.len().to_string())?;
+
+    // The cold request is deliberately not consumed or replayed. Closing the
+    // downstream connection prevents unread body bytes from becoming a later
+    // request on the same HTTP/1.1 connection.
+    session.as_downstream_mut().set_keepalive(None);
+    session
+        .write_response_header(Box::new(response), head)
+        .await?;
+    if head {
+        Ok(())
+    } else {
+        session
+            .write_response_body(Some(Bytes::from_static(body)), true)
+            .await
+    }
+}
+
+fn prefers_html_loading(request: &RequestHeader) -> bool {
+    if request.method != Method::GET && request.method != Method::HEAD {
+        return false;
+    }
+
+    request.headers.get_all(ACCEPT).iter().any(|value| {
+        let Ok(value) = value.to_str() else {
+            return false;
+        };
+        value.split(',').any(html_media_range_is_accepted)
+    })
+}
+
+fn html_media_range_is_accepted(media_range: &str) -> bool {
+    let mut parts = media_range.split(';');
+    if !parts
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/html"))
+    {
+        return false;
+    }
+
+    parts
+        .filter_map(|parameter| parameter.split_once('='))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
+        .is_none_or(|(_, value)| {
+            value
+                .trim()
+                .parse::<f32>()
+                .is_ok_and(|quality| quality > 0.0 && quality <= 1.0)
+        })
 }
 
 fn is_valid_websocket_request(request: &RequestHeader) -> bool {
@@ -328,5 +414,33 @@ mod tests {
         assert_eq!(response.headers.get_all("set-cookie").iter().count(), 2);
         assert!(response.headers.contains_key("www-authenticate"));
         assert!(!response.headers.contains_key("x-hop"));
+    }
+
+    #[test]
+    fn loading_html_requires_a_safe_method_and_explicit_html_acceptance() {
+        let mut get = RequestHeader::build("GET", b"/", Some(4)).unwrap();
+        get.insert_header(ACCEPT, "application/json, text/html;q=0.5")
+            .unwrap();
+        assert!(prefers_html_loading(&get));
+
+        let mut head = RequestHeader::build("HEAD", b"/", Some(4)).unwrap();
+        head.insert_header(ACCEPT, "TEXT/HTML").unwrap();
+        assert!(prefers_html_loading(&head));
+
+        let mut api_get = RequestHeader::build("GET", b"/", Some(4)).unwrap();
+        api_get
+            .insert_header(ACCEPT, "application/json, */*")
+            .unwrap();
+        assert!(!prefers_html_loading(&api_get));
+
+        let mut rejected_html = RequestHeader::build("GET", b"/", Some(4)).unwrap();
+        rejected_html
+            .insert_header(ACCEPT, "text/html;q=0")
+            .unwrap();
+        assert!(!prefers_html_loading(&rejected_html));
+
+        let mut post = RequestHeader::build("POST", b"/", Some(4)).unwrap();
+        post.insert_header(ACCEPT, "text/html").unwrap();
+        assert!(!prefers_html_loading(&post));
     }
 }

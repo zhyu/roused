@@ -1,6 +1,9 @@
-use std::fs;
+#![allow(dead_code)]
+
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,7 +44,20 @@ impl RawServer {
                         stream
                             .set_write_timeout(Some(IO_TIMEOUT))
                             .expect("set fixture write timeout");
-                        handler(stream);
+                        let mut first_byte = [0; 1];
+                        match stream.peek(&mut first_byte) {
+                            Ok(0) => {
+                                // Milestone 2 readiness probes connect and close
+                                // without sending an HTTP request.
+                            }
+                            Ok(_) => handler(stream),
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                                ) => {}
+                            Err(error) => panic!("fixture peek failed: {error}"),
+                        }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -77,22 +93,41 @@ impl Drop for RawServer {
 pub struct ProxyProcess {
     address: SocketAddr,
     child: Child,
+    stderr_path: Option<PathBuf>,
     _configuration_directory: tempfile::TempDir,
 }
 
 impl ProxyProcess {
     pub fn spawn(make_configuration: impl FnOnce(SocketAddr) -> String) -> Self {
+        Self::spawn_inner(make_configuration, false)
+    }
+
+    pub fn spawn_with_stderr_capture(
+        make_configuration: impl FnOnce(SocketAddr) -> String,
+    ) -> Self {
+        Self::spawn_inner(make_configuration, true)
+    }
+
+    fn spawn_inner(
+        make_configuration: impl FnOnce(SocketAddr) -> String,
+        capture_stderr: bool,
+    ) -> Self {
         let address = unused_loopback_address();
         let configuration = make_configuration(address);
         let configuration_directory =
             tempfile::tempdir().expect("create proxy configuration directory");
         let configuration_path = configuration_directory.path().join("roused.toml");
         fs::write(&configuration_path, configuration).expect("write proxy configuration");
+        let stderr_path =
+            capture_stderr.then(|| configuration_directory.path().join("roused.stderr"));
+        let stderr = stderr_path.as_ref().map_or_else(Stdio::null, |path| {
+            Stdio::from(File::create(path).expect("create proxy stderr capture"))
+        });
 
         let mut child = Command::new(env!("CARGO_BIN_EXE_roused"))
             .arg(configuration_path)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()
             .expect("start roused");
         let deadline = Instant::now() + Duration::from_secs(8);
@@ -110,12 +145,20 @@ impl ProxyProcess {
         Self {
             address,
             child,
+            stderr_path,
             _configuration_directory: configuration_directory,
         }
     }
 
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    pub fn stderr_contents(&self) -> String {
+        self.stderr_path
+            .as_ref()
+            .map(|path| fs::read_to_string(path).expect("read proxy stderr capture"))
+            .unwrap_or_default()
     }
 }
 

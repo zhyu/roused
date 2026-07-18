@@ -1475,10 +1475,12 @@ dependencies = [
  "bytes",
  "env_logger",
  "http",
+ "libc",
  "log",
  "pingora",
  "serde",
  "tempfile",
+ "tokio",
  "toml",
 ]
 
