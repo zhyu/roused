@@ -1473,6 +1473,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "clap",
  "env_logger",
  "http",
  "libc",

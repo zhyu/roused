@@ -367,21 +367,10 @@ fn launchd_restarts_the_gateway_and_restart_gives_a_running_target_fresh_grace()
 }
 
 #[test]
-fn launch_agent_templates_have_the_required_static_contracts() {
+fn target_launch_agent_template_has_the_required_static_contract() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let gateway_path = root.join("packaging/launchd/roused-gateway.plist");
     let target_path = root.join("packaging/launchd/roused-target.plist");
-    assert_plist_is_valid(&gateway_path);
     assert_plist_is_valid(&target_path);
-
-    let gateway =
-        normalized_xml(&fs::read_to_string(&gateway_path).expect("read gateway template"));
-    assert!(gateway.contains("<key>Label</key> <string>net.example.roused</string>"));
-    assert!(gateway.contains("<key>RunAtLoad</key> <true/>"));
-    assert!(gateway.contains("<key>KeepAlive</key> <true/>"));
-    assert!(gateway.contains(
-        "<string>/ABSOLUTE/PATH/TO/roused</string> <string>/ABSOLUTE/PATH/TO/roused.toml</string>"
-    ));
 
     let target = normalized_xml(&fs::read_to_string(&target_path).expect("read target template"));
     assert!(target.contains("<key>Label</key> <string>net.example.service</string>"));
@@ -705,19 +694,26 @@ impl GatewayLaunchAgentFixture {
         let stdout_log = directory.path().join("gateway.stdout");
         let stderr_log = directory.path().join("gateway.stderr");
         let binary = Path::new(env!("CARGO_BIN_EXE_roused"));
-        let template_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/launchd/roused-gateway.plist");
-        let template =
-            fs::read_to_string(template_path).expect("read gateway LaunchAgent template");
-        let rendered = render_gateway_template(
-            &template,
-            &label,
-            binary,
-            &configuration_path,
-            &stdout_log,
-            &stderr_log,
+        let generated = Command::new(binary)
+            .arg("init-gateway-plist")
+            .arg("--label")
+            .arg(&label)
+            .arg("--config")
+            .arg(&configuration_path)
+            .arg("--output")
+            .arg(&plist)
+            .arg("--program")
+            .arg(binary)
+            .output()
+            .expect("generate gateway fixture plist");
+        assert!(
+            generated.status.success(),
+            "gateway plist generation failed: {}",
+            String::from_utf8_lossy(&generated.stderr)
         );
-        fs::write(&plist, rendered).expect("write gateway fixture plist");
+        insert_plist_string(&plist, "StandardOutPath", &stdout_log);
+        insert_plist_string(&plist, "StandardErrorPath", &stderr_log);
+        assert_plist_is_valid(&plist);
 
         Self {
             _directory: directory,
@@ -929,32 +925,6 @@ fn target_launch_agent_plist(
         xml_escape(&stdout_log.display().to_string()),
         xml_escape(&stderr_log.display().to_string()),
     )
-}
-
-fn render_gateway_template(
-    template: &str,
-    label: &str,
-    binary: &Path,
-    configuration: &Path,
-    stdout_log: &Path,
-    stderr_log: &Path,
-) -> String {
-    let rendered = template
-        .replace("net.example.roused", &xml_escape(label))
-        .replace(
-            "/ABSOLUTE/PATH/TO/roused.toml",
-            &xml_escape(&configuration.display().to_string()),
-        )
-        .replace(
-            "/ABSOLUTE/PATH/TO/roused",
-            &xml_escape(&binary.display().to_string()),
-        );
-    let logging = format!(
-        "  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n",
-        xml_escape(&stdout_log.display().to_string()),
-        xml_escape(&stderr_log.display().to_string()),
-    );
-    rendered.replacen("</dict>", &format!("{logging}</dict>"), 1)
 }
 
 fn install_sigterm_recorder(path: &Path) {
@@ -1169,6 +1139,21 @@ fn assert_plist_is_valid(path: &Path) {
         output.status.success(),
         "{} is not a valid plist: {}",
         path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn insert_plist_string(plist: &Path, key: &str, value: &Path) {
+    let output = Command::new("/usr/bin/plutil")
+        .args(["-insert", key, "-string"])
+        .arg(value)
+        .arg(plist)
+        .output()
+        .expect("insert test-only plist value");
+    assert!(
+        output.status.success(),
+        "cannot insert {key} into {}: {}",
+        plist.display(),
         String::from_utf8_lossy(&output.stderr)
     );
 }

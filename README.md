@@ -25,10 +25,15 @@ authentication.
 ## Requirements and security warning
 
 - macOS with a logged-in GUI user session;
-- Rust/Cargo with Rust 2024 edition support and CMake to build Roused;
-- target services already defined as current-user LaunchAgents; and
+- a Roused executable in a stable location;
+- target services already defined and bootstrapped as current-user
+  LaunchAgents in `gui/$UID`; and
 - DNS or client host configuration that points each configured hostname to the
   Mac running Roused.
+
+Building Roused from source additionally requires Rust/Cargo with Rust 2024
+edition support and CMake. These tools are not required to run a downloaded
+executable.
 
 Roused serves unencrypted HTTP and has no authentication layer of its own.
 Basic, Bearer, cookie, and body-token credentials pass through to the upstream
@@ -37,56 +42,53 @@ network and never expose it directly to the public internet.
 
 ## Quick start
 
-Build the committed dependency graph:
+The normal setup path needs only the Roused executable. If you are building
+from a source checkout instead, build the committed dependency graph and put
+the resulting executable at a stable absolute path:
 
 ```sh
 cargo build --locked --release
 ```
 
-Prepare the target service as a current-user LaunchAgent. The supplied template
-is a starting point, not an installer:
+Each target must already use `RunAtLoad=false` and `KeepAlive=false`, listen on
+its configured loopback address, and have a `Label` equal to the corresponding
+`launchd_label` in the Roused configuration. Bootstrapping the target plist in
+`gui/$UID` loads its definition without starting it. If you have a source
+checkout, `packaging/launchd/roused-target.plist` is available as a reference
+for defining a target; Roused does not consume, install, or edit that file.
+
+Generate a starter configuration at a new path:
 
 ```sh
-cp packaging/launchd/roused-target.plist \
-  "$HOME/Library/LaunchAgents/net.example.service.plist"
-# Edit the copy: set its label and absolute executable/argument paths.
-/usr/bin/plutil -lint \
-  "$HOME/Library/LaunchAgents/net.example.service.plist"
-/bin/launchctl bootstrap "gui/$(id -u)" \
-  "$HOME/Library/LaunchAgents/net.example.service.plist"
+roused init-config /absolute/path/to/roused.toml
 ```
 
-The target must use `RunAtLoad=false` and `KeepAlive=false`, listen on the
-configured loopback address, and have a `Label` equal to `launchd_label` in the
-Roused configuration. Bootstrapping loads its definition without starting it.
-If the target is already correctly bootstrapped, do not bootstrap it again.
+The generated file contains two distinct, valid `[[services]]` entries to show
+how multiple services are configured. Edit every retained entry for a real
+target, add another complete `[[services]]` block for each additional target,
+and delete an unused starter block. At least one service is required. These
+entries configure routing; they do not create or install target services.
 
-Create a configuration file such as `roused.toml`:
+Set `listen` to `0.0.0.0:<port>` to accept cleartext connections on every IPv4
+interface, or use `127.0.0.1:<port>` if only local clients should reach the
+gateway. Then validate the complete file without starting Roused or touching
+launchd:
 
-```toml
-listen = "0.0.0.0:8080"
-
-[[services]]
-host = "service.apps.home.arpa"
-upstream = "127.0.0.1:9000"
-launchd_label = "net.example.service"
-idle_timeout_seconds = 1800
-can_stop_command = ["/absolute/path/to/can-stop", "--literal-argument"]
+```sh
+roused check-config /absolute/path/to/roused.toml
 ```
-
-`0.0.0.0` accepts cleartext connections on every IPv4 interface. Use
-`127.0.0.1` instead if only local clients should reach the gateway.
 
 Run Roused in the foreground:
 
 ```sh
-./target/release/roused /absolute/path/to/roused.toml
+roused /absolute/path/to/roused.toml
 ```
 
-Roused validates the complete configuration before it binds the listener. It
-has no validation-only command and does not reload configuration at runtime.
+Foreground startup uses the same complete validation as `check-config` before
+binding the listener. Roused does not reload configuration at runtime.
 
-For a local smoke test without changing DNS:
+For a local smoke test without changing DNS, substitute one configured host
+and the configured listener port in both places:
 
 ```sh
 curl -i --resolve service.apps.home.arpa:8080:127.0.0.1 \
@@ -97,6 +99,19 @@ A stopped target normally makes the first request return `503 Service
 Unavailable` with `Retry-After: 5`. Retry after the target begins listening;
 the later request should reach the service. Roused configures routing only—it
 does not create DNS records.
+
+The command interfaces are:
+
+```text
+roused <config.toml>
+roused init-config OUTPUT
+roused check-config CONFIG
+roused init-gateway-plist --label LABEL --config CONFIG --output OUTPUT [--program PROGRAM]
+```
+
+Use `roused --help` or a command's `--help` for concise usage information.
+Argument and configuration errors are reported as `roused: ...` and exit with
+status 2. Both generation commands refuse to overwrite an existing output.
 
 ## Configuration reference
 
@@ -113,10 +128,11 @@ At least one service is required. Normalized hosts, upstreams, and launchd
 labels must be unique. Unknown fields and any invalid entry reject the entire
 configuration.
 
-Roused accepts launchd labels, never plist paths. Startup validation does not
-inspect a target's plist or prove that its job exists. A missing label, a job
-that was not bootstrapped, or a service listening at the wrong address becomes
-visible when wake attempts fail and clients continue receiving `503` responses.
+Roused accepts launchd labels, never target plist paths. Neither startup nor
+`check-config` inspects a target's plist or proves that its job exists. A
+missing label, a job that was not bootstrapped, or a service listening at the
+wrong address becomes visible when wake attempts fail and clients continue
+receiving `503` responses.
 
 ## Request and wake behavior
 
@@ -181,32 +197,42 @@ repair its restart policy.
 
 ## Run Roused at login
 
-After the foreground smoke test succeeds, install the gateway as another
-current-user LaunchAgent:
+After the foreground smoke test succeeds, generate the gateway's current-user
+LaunchAgent plist at a new, absolute output path:
 
 ```sh
-cp packaging/launchd/roused-gateway.plist \
-  "$HOME/Library/LaunchAgents/net.example.roused.plist"
-# Edit the copy to use absolute paths to the release binary and TOML file.
+roused init-gateway-plist \
+  --label net.example.roused \
+  --config /absolute/path/to/roused.toml \
+  --output "$HOME/Library/LaunchAgents/net.example.roused.plist" \
+  --program /stable/absolute/path/to/roused
 /usr/bin/plutil -lint \
   "$HOME/Library/LaunchAgents/net.example.roused.plist"
 /bin/launchctl bootstrap "gui/$(id -u)" \
   "$HOME/Library/LaunchAgents/net.example.roused.plist"
 ```
 
-The template uses `RunAtLoad=true` and `KeepAlive=true`, so launchd starts and
-restarts the gateway. Restarting Roused does not restart a target that is
-already listening; that target is proxied immediately and receives a fresh
-in-memory idle grace period.
+`--config`, `--output`, and an explicit `--program` must be written as lexical
+absolute paths. Their spelling is preserved, so `--program` can deliberately
+name a stable installed or Homebrew symlink. If `--program` is omitted, Roused
+derives the absolute path of its current executable. The command validates the
+configuration, safely escapes the generated XML, and refuses to overwrite an
+existing output. It generates only the selected gateway plist; it does not
+bootstrap it, invoke `launchctl`, or inspect or change target plists.
 
-To unload the example jobs, address their current-user service targets:
+The generated plist uses `RunAtLoad=true` and `KeepAlive=true`, so launchd
+starts and restarts the gateway after you bootstrap it manually. Restarting
+Roused does not restart a target that is already listening; that target is
+proxied immediately and receives a fresh in-memory idle grace period.
+
+To unload the generated gateway job, address its current-user service target:
 
 ```sh
 /bin/launchctl bootout "gui/$(id -u)/net.example.roused"
-/bin/launchctl bootout "gui/$(id -u)/net.example.service"
 ```
 
-None of these operations needs `sudo` or writes under `/Library`.
+Manage target jobs separately according to their own setup. None of these
+gateway operations needs `sudo` or writes under `/Library`.
 
 ## Troubleshooting
 

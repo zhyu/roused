@@ -1,5 +1,5 @@
 use http::uri::Authority;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -9,14 +9,14 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 1_800;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     listen: String,
     services: Vec<RawService>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawService {
     host: String,
@@ -24,6 +24,7 @@ struct RawService {
     launchd_label: String,
     #[serde(default = "default_idle_timeout_seconds")]
     idle_timeout_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     can_stop_command: Option<Vec<String>>,
 }
 
@@ -47,6 +48,29 @@ pub struct ServiceConfig {
 }
 
 impl Config {
+    pub fn starter_toml() -> Result<String, toml::ser::Error> {
+        let starter = RawConfig {
+            listen: "0.0.0.0:8080".into(),
+            services: vec![
+                RawService {
+                    host: "first-service.apps.home.arpa".into(),
+                    upstream: "127.0.0.1:9001".into(),
+                    launchd_label: "net.example.first-service".into(),
+                    idle_timeout_seconds: DEFAULT_IDLE_TIMEOUT_SECONDS,
+                    can_stop_command: None,
+                },
+                RawService {
+                    host: "second-service.apps.home.arpa".into(),
+                    upstream: "127.0.0.1:9002".into(),
+                    launchd_label: "net.example.second-service".into(),
+                    idle_timeout_seconds: DEFAULT_IDLE_TIMEOUT_SECONDS,
+                    can_stop_command: None,
+                },
+            ],
+        };
+        toml::to_string_pretty(&starter)
+    }
+
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let input = fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.to_path_buf(),
@@ -191,7 +215,7 @@ fn validate_command(command: Option<&[String]>, service_number: usize) -> Result
     Ok(())
 }
 
-fn valid_launchd_label(label: &str) -> bool {
+pub(crate) fn valid_launchd_label(label: &str) -> bool {
     !label.is_empty()
         && label.chars().all(|character| {
             character != '/' && !character.is_control() && !character.is_whitespace()
@@ -307,6 +331,24 @@ launchd_label = "net.test.alpha"
         assert_eq!(service.launchd_label(), "net.test.alpha");
         assert_eq!(service.idle_timeout_seconds(), 1_800);
         assert!(service.can_stop_command().is_none());
+    }
+
+    #[test]
+    fn starter_toml_is_deterministic_and_round_trips_with_two_services() {
+        let first = Config::starter_toml().unwrap();
+        let second = Config::starter_toml().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.matches("[[services]]").count(), 2);
+
+        let config = Config::from_toml(&first).unwrap();
+        let services = config.services().collect::<Vec<_>>();
+        assert_eq!(services.len(), 2);
+        assert_eq!(services[0].host(), "first-service.apps.home.arpa");
+        assert_eq!(services[0].upstream(), "127.0.0.1:9001".parse().unwrap());
+        assert_eq!(services[0].launchd_label(), "net.example.first-service");
+        assert_eq!(services[1].host(), "second-service.apps.home.arpa");
+        assert_eq!(services[1].upstream(), "127.0.0.1:9002".parse().unwrap());
+        assert_eq!(services[1].launchd_label(), "net.example.second-service");
     }
 
     #[test]
