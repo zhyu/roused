@@ -148,7 +148,8 @@ idle timeout. SSE has no support guarantee.
 Lifecycle work starts only in Milestone 2. Targets are existing,
 already-bootstrapped jobs in `gui/$UID`, with `RunAtLoad=false` and
 `KeepAlive=false`. Configuration contains their labels, never plist paths.
-Roused does not install, edit, inspect, or repair target jobs.
+Target plist authoring is service-specific, so Roused ships no generic target
+plist. Roused does not install, edit, inspect, or repair target jobs.
 
 Milestone 2 uses a short loopback TCP connect for readiness and a deduplicated
 `/bin/launchctl kickstart gui/$UID/<label>` without `-k`. Milestone 3 accounts

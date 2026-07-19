@@ -53,9 +53,31 @@ cargo build --locked --release
 Each target must already use `RunAtLoad=false` and `KeepAlive=false`, listen on
 its configured loopback address, and have a `Label` equal to the corresponding
 `launchd_label` in the Roused configuration. Bootstrapping the target plist in
-`gui/$UID` loads its definition without starting it. If you have a source
-checkout, `packaging/launchd/roused-target.plist` is available as a reference
-for defining a target; Roused does not consume, install, or edit that file.
+`gui/$UID` loads its definition without starting it. Prefer the target
+application's own LaunchAgent setup when it provides one. Otherwise, macOS's
+built-in `plutil` can construct a minimal definition at a new path. The
+`-create` operation replaces an existing file, so do not run this sequence over
+a plist you already manage:
+
+```sh
+/bin/mkdir -p "$HOME/Library/LaunchAgents"
+target_plist="$HOME/Library/LaunchAgents/net.example.service.plist"
+/usr/bin/plutil -create xml1 "$target_plist"
+/usr/bin/plutil -insert Label -string net.example.service "$target_plist"
+/usr/bin/plutil -insert ProgramArguments -array "$target_plist"
+/usr/bin/plutil -insert ProgramArguments.0 -string \
+  "/absolute/path/to/target-service" "$target_plist"
+/usr/bin/plutil -insert RunAtLoad -bool false "$target_plist"
+/usr/bin/plutil -insert KeepAlive -bool false "$target_plist"
+/usr/bin/plutil -lint "$target_plist"
+/bin/launchctl bootstrap "gui/$(id -u)" "$target_plist"
+```
+
+Add service-specific arguments at `ProgramArguments.1`,
+`ProgramArguments.2`, and so on before linting. Other keys such as environment,
+working-directory, or logging settings belong to the target and should follow
+its documentation or `man 5 launchd.plist`. Roused does not generate or manage
+this plist.
 
 Generate a starter configuration at a new path:
 

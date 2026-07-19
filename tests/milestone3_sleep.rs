@@ -367,19 +367,6 @@ fn launchd_restarts_the_gateway_and_restart_gives_a_running_target_fresh_grace()
 }
 
 #[test]
-fn target_launch_agent_template_has_the_required_static_contract() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_path = root.join("packaging/launchd/roused-target.plist");
-    assert_plist_is_valid(&target_path);
-
-    let target = normalized_xml(&fs::read_to_string(&target_path).expect("read target template"));
-    assert!(target.contains("<key>Label</key> <string>net.example.service</string>"));
-    assert!(target.contains("<key>RunAtLoad</key> <false/>"));
-    assert!(target.contains("<key>KeepAlive</key> <false/>"));
-    assert!(target.contains("<string>/ABSOLUTE/PATH/TO/target-service</string>"));
-}
-
-#[test]
 #[ignore = "entry point for the disposable Milestone 3 target LaunchAgent"]
 fn target_launch_agent_child_entry() {
     let Ok(address) = env::var(TARGET_ADDRESS_ENV) else {
@@ -1123,10 +1110,6 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
-}
-
-fn normalized_xml(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn assert_plist_is_valid(path: &Path) {
