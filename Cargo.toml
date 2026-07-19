@@ -2,6 +2,9 @@
 name = "roused"
 version = "0.1.0"
 edition = "2024"
+description = "A macOS activation reverse proxy for current-user LaunchAgents"
+repository = "https://github.com/zhyu/roused"
+readme = "README.md"
 
 [dependencies]
 async-trait = "0.1.89"

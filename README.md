@@ -40,6 +40,25 @@ Basic, Bearer, cookie, and body-token credentials pass through to the upstream
 in cleartext on the network. Use it only on a deliberately trusted private
 network and never expose it directly to the public internet.
 
+## Install a nightly build
+
+Each successful `main` build publishes an Apple-silicon archive and SHA-256
+checksum to the moving
+[`nightly` prerelease](https://github.com/zhyu/roused/releases/tag/nightly):
+
+```sh
+curl --fail --location --remote-name \
+  https://github.com/zhyu/roused/releases/download/nightly/roused-macos-arm64.tar.gz
+curl --fail --location --remote-name \
+  https://github.com/zhyu/roused/releases/download/nightly/roused-macos-arm64.tar.gz.sha256
+shasum -a 256 --check roused-macos-arm64.tar.gz.sha256
+tar -xzf roused-macos-arm64.tar.gz
+./roused-macos-arm64/roused --help
+```
+
+Move the executable to a stable, user-writable absolute path before generating
+a gateway LaunchAgent. Nightly binaries are not code-signed or notarized.
+
 ## Quick start
 
 The normal setup path needs only the Roused executable. If you are building
