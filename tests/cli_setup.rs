@@ -139,6 +139,8 @@ fn init_gateway_plist_generates_escaped_lintable_structured_output() {
     let config_path = special_directory.join("roused & <config> \"one\" 'two'.toml");
     let output_path = special_directory.join("gateway & <output> \"one\" 'two'.plist");
     let program_path = special_directory.join("roused & <stable> \"one\" 'two'");
+    let log_directory = special_directory.join("logs & <xml> \"quoted\" 'single'");
+    fs::create_dir(&log_directory).expect("create log directory");
     fs::write(
         &config_path,
         valid_configuration("127.0.0.1:18080".parse().unwrap()),
@@ -146,9 +148,17 @@ fn init_gateway_plist_generates_escaped_lintable_structured_output() {
     .expect("write referenced configuration");
     fs::write(&program_path, b"").expect("write selected program fixture");
     let label = "net.example.roused&<gateway>\"quoted\"'single'";
+    let stdout_log_path = log_directory.join(format!("{label}.stdout.log"));
+    let stderr_log_path = log_directory.join(format!("{label}.stderr.log"));
 
-    let output =
-        run_init_gateway_plist(label, &config_path, &output_path, Some(&program_path), None);
+    let output = run_init_gateway_plist(
+        label,
+        &config_path,
+        &output_path,
+        Some(&program_path),
+        &log_directory,
+        None,
+    );
     assert_success(&output);
     let stdout = stdout(&output);
     assert!(
@@ -170,15 +180,36 @@ fn init_gateway_plist_generates_escaped_lintable_structured_output() {
     );
     assert_eq!(plist_raw(&output_path, "RunAtLoad"), "true");
     assert_eq!(plist_raw(&output_path, "KeepAlive"), "true");
+    assert_eq!(
+        plist_raw(&output_path, "StandardOutPath"),
+        stdout_log_path
+            .to_str()
+            .expect("UTF-8 standard output path")
+    );
+    assert_eq!(
+        plist_raw(&output_path, "StandardErrorPath"),
+        stderr_log_path.to_str().expect("UTF-8 standard error path")
+    );
 
     let xml = fs::read_to_string(&output_path).expect("read generated plist XML");
     assert!(xml.contains("&amp;"), "ampersands were not XML-escaped");
     assert!(xml.contains("&lt;"), "less-than signs were not XML-escaped");
+    assert!(
+        !stdout_log_path.exists(),
+        "generator created the stdout log"
+    );
+    assert!(
+        !stderr_log_path.exists(),
+        "generator created the stderr log"
+    );
 }
 
 #[test]
-fn init_gateway_plist_safely_derives_an_absolute_default_program() {
+fn init_gateway_plist_safely_derives_default_program_and_log_directory() {
     let directory = tempfile::tempdir().expect("create default-program directory");
+    let home_directory = directory.path().join("home");
+    let default_log_directory = home_directory.join("Library/Logs");
+    fs::create_dir_all(&default_log_directory).expect("create default log directory");
     let config_path = directory.path().join("roused.toml");
     let output_path = directory.path().join("gateway.plist");
     fs::write(
@@ -187,8 +218,17 @@ fn init_gateway_plist_safely_derives_an_absolute_default_program() {
     )
     .expect("write referenced configuration");
 
-    let output =
-        run_init_gateway_plist("net.example.roused", &config_path, &output_path, None, None);
+    let mut command = roused_command();
+    command
+        .arg("init-gateway-plist")
+        .arg("--label")
+        .arg("net.example.roused")
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--output")
+        .arg(&output_path)
+        .env("HOME", &home_directory);
+    let output = run_to_exit(command);
     assert_success(&output);
     assert_plist_is_valid(&output_path);
     let selected_program = PathBuf::from(plist_raw(&output_path, "ProgramArguments.0"));
@@ -197,6 +237,99 @@ fn init_gateway_plist_safely_derives_an_absolute_default_program() {
         fs::canonicalize(selected_program).expect("canonicalize derived program"),
         fs::canonicalize(env!("CARGO_BIN_EXE_roused")).expect("canonicalize test binary")
     );
+    let stdout_log = default_log_directory.join("net.example.roused.stdout.log");
+    let stderr_log = default_log_directory.join("net.example.roused.stderr.log");
+    assert_eq!(
+        plist_raw(&output_path, "StandardOutPath"),
+        stdout_log.to_str().expect("UTF-8 default stdout path")
+    );
+    assert_eq!(
+        plist_raw(&output_path, "StandardErrorPath"),
+        stderr_log.to_str().expect("UTF-8 default stderr path")
+    );
+    assert!(!stdout_log.exists(), "generator created the stdout log");
+    assert!(!stderr_log.exists(), "generator created the stderr log");
+}
+
+#[test]
+fn init_gateway_plist_reports_an_unusable_default_log_directory() {
+    let directory = tempfile::tempdir().expect("create default-log validation directory");
+    let config_path = directory.path().join("roused.toml");
+    fs::write(
+        &config_path,
+        valid_configuration("127.0.0.1:18085".parse().unwrap()),
+    )
+    .expect("write valid configuration");
+
+    let run_with_home = |output_path: &Path, home: Option<&Path>| {
+        let mut command = roused_command();
+        command
+            .arg("init-gateway-plist")
+            .arg("--label")
+            .arg("net.example.roused")
+            .arg("--config")
+            .arg(&config_path)
+            .arg("--output")
+            .arg(output_path);
+        if let Some(home) = home {
+            command.env("HOME", home);
+        } else {
+            command.env_remove("HOME");
+        }
+        run_to_exit(command)
+    };
+
+    let missing_home_output = directory.path().join("missing-home.plist");
+    let missing_home = run_with_home(&missing_home_output, None);
+    assert_exit_2(&missing_home);
+    let missing_home_diagnostic = stderr(&missing_home);
+    assert!(missing_home_diagnostic.contains("HOME"));
+    assert!(missing_home_diagnostic.contains("--log-dir"));
+    assert!(!missing_home_output.exists());
+
+    let relative_home_output = directory.path().join("relative-home.plist");
+    let relative_home = run_with_home(&relative_home_output, Some(Path::new("relative-home")));
+    assert_exit_2(&relative_home);
+    let relative_home_diagnostic = stderr(&relative_home);
+    assert!(relative_home_diagnostic.contains("absolute"));
+    assert!(relative_home_diagnostic.contains("--log-dir"));
+    assert!(!relative_home_output.exists());
+
+    let home_without_logs = directory.path().join("home-without-logs");
+    fs::create_dir(&home_without_logs).expect("create home without default log directory");
+    let missing_default_output = directory.path().join("missing-default.plist");
+    let missing_default = run_with_home(&missing_default_output, Some(&home_without_logs));
+    assert_exit_2(&missing_default);
+    let missing_default_diagnostic = stderr(&missing_default).to_ascii_lowercase();
+    assert!(
+        missing_default_diagnostic.contains("log directory"),
+        "{missing_default_diagnostic}"
+    );
+    assert!(missing_default_diagnostic.contains("--log-dir"));
+    assert!(!home_without_logs.join("Library/Logs").exists());
+    assert!(!missing_default_output.exists());
+
+    let home_with_non_directory_logs = directory.path().join("home-with-file-logs");
+    fs::create_dir_all(home_with_non_directory_logs.join("Library"))
+        .expect("create home Library directory");
+    fs::write(
+        home_with_non_directory_logs.join("Library/Logs"),
+        b"not a directory\n",
+    )
+    .expect("write non-directory default log fixture");
+    let non_directory_default_output = directory.path().join("non-directory-default.plist");
+    let non_directory_default = run_with_home(
+        &non_directory_default_output,
+        Some(&home_with_non_directory_logs),
+    );
+    assert_exit_2(&non_directory_default);
+    let non_directory_default_diagnostic = stderr(&non_directory_default).to_ascii_lowercase();
+    assert!(
+        non_directory_default_diagnostic.contains("not a directory"),
+        "{non_directory_default_diagnostic}"
+    );
+    assert!(non_directory_default_diagnostic.contains("--log-dir"));
+    assert!(!non_directory_default_output.exists());
 }
 
 #[test]
@@ -224,6 +357,7 @@ fn init_gateway_plist_validates_config_and_refuses_to_overwrite() {
         &invalid_config,
         &invalid_output,
         Some(program),
+        directory.path(),
         None,
     );
     assert_exit_2(&invalid);
@@ -239,6 +373,7 @@ fn init_gateway_plist_validates_config_and_refuses_to_overwrite() {
         &valid_config,
         &invalid_label_output,
         Some(program),
+        directory.path(),
         None,
     );
     assert_exit_2(&invalid_label);
@@ -256,6 +391,7 @@ fn init_gateway_plist_validates_config_and_refuses_to_overwrite() {
         &valid_config,
         &existing_output,
         Some(program),
+        directory.path(),
         None,
     );
     assert_exit_2(&overwrite);
@@ -267,7 +403,7 @@ fn init_gateway_plist_validates_config_and_refuses_to_overwrite() {
 }
 
 #[test]
-fn init_gateway_plist_requires_absolute_config_output_and_program_paths() {
+fn init_gateway_plist_requires_all_paths_to_be_absolute() {
     let directory = tempfile::tempdir().expect("create absolute-path directory");
     let config_path = directory.path().join("roused.toml");
     let output_path = directory.path().join("gateway.plist");
@@ -283,6 +419,7 @@ fn init_gateway_plist_requires_absolute_config_output_and_program_paths() {
         Path::new("roused.toml"),
         &output_path,
         Some(program),
+        directory.path(),
         Some(directory.path()),
     );
     assert_absolute_path_error(&relative_config, "config");
@@ -293,6 +430,7 @@ fn init_gateway_plist_requires_absolute_config_output_and_program_paths() {
         &config_path,
         Path::new("gateway.plist"),
         Some(program),
+        directory.path(),
         Some(directory.path()),
     );
     assert_absolute_path_error(&relative_output, "output");
@@ -303,10 +441,80 @@ fn init_gateway_plist_requires_absolute_config_output_and_program_paths() {
         &config_path,
         &output_path,
         Some(Path::new("roused")),
+        directory.path(),
         Some(directory.path()),
     );
     assert_absolute_path_error(&relative_program, "program");
     assert!(!output_path.exists());
+
+    let relative_log_directory = run_init_gateway_plist(
+        "net.example.roused",
+        &config_path,
+        &output_path,
+        Some(program),
+        Path::new("logs"),
+        Some(directory.path()),
+    );
+    assert_absolute_path_error(&relative_log_directory, "log directory");
+    assert!(!output_path.exists());
+}
+
+#[test]
+fn init_gateway_plist_requires_an_existing_log_directory() {
+    let directory = tempfile::tempdir().expect("create log-directory validation directory");
+    let config_path = directory.path().join("roused.toml");
+    let missing_log_directory = directory.path().join("missing-logs");
+    let regular_file = directory.path().join("not-a-directory");
+    let missing_output = directory.path().join("missing-directory.plist");
+    let regular_file_output = directory.path().join("regular-file.plist");
+    fs::write(
+        &config_path,
+        valid_configuration("127.0.0.1:18084".parse().unwrap()),
+    )
+    .expect("write valid configuration");
+    fs::write(&regular_file, b"not a directory\n").expect("write regular-file fixture");
+
+    let missing = run_init_gateway_plist(
+        "net.example.roused",
+        &config_path,
+        &missing_output,
+        Some(Path::new(env!("CARGO_BIN_EXE_roused"))),
+        &missing_log_directory,
+        None,
+    );
+    assert_exit_2(&missing);
+    let missing_diagnostic = stderr(&missing).to_ascii_lowercase();
+    assert!(
+        missing_diagnostic.contains("log directory"),
+        "{missing_diagnostic}"
+    );
+    assert!(
+        missing_diagnostic.contains(
+            &missing_log_directory
+                .display()
+                .to_string()
+                .to_ascii_lowercase()
+        ),
+        "{missing_diagnostic}"
+    );
+    assert!(!missing_log_directory.exists());
+    assert!(!missing_output.exists());
+
+    let not_directory = run_init_gateway_plist(
+        "net.example.roused",
+        &config_path,
+        &regular_file_output,
+        Some(Path::new(env!("CARGO_BIN_EXE_roused"))),
+        &regular_file,
+        None,
+    );
+    assert_exit_2(&not_directory);
+    let not_directory_diagnostic = stderr(&not_directory).to_ascii_lowercase();
+    assert!(
+        not_directory_diagnostic.contains("not a directory"),
+        "{not_directory_diagnostic}"
+    );
+    assert!(!regular_file_output.exists());
 }
 
 #[test]
@@ -327,6 +535,11 @@ fn cli_help_and_argument_errors_are_concise_and_use_exit_code_two() {
             assert!(stdout.contains(command_name), "{stdout}");
         }
     }
+
+    let mut gateway_help = roused_command();
+    gateway_help.args(["init-gateway-plist", "--help"]);
+    let gateway_help = stdout(&run_to_exit(gateway_help));
+    assert!(gateway_help.contains("--log-dir"), "{gateway_help}");
 
     let mut top_help = roused_command();
     top_help.arg("--help");
@@ -373,6 +586,7 @@ fn run_init_gateway_plist(
     config: &Path,
     output: &Path,
     program: Option<&Path>,
+    log_directory: &Path,
     current_directory: Option<&Path>,
 ) -> Output {
     let mut command = roused_command();
@@ -383,7 +597,9 @@ fn run_init_gateway_plist(
         .arg("--config")
         .arg(config)
         .arg("--output")
-        .arg(output);
+        .arg(output)
+        .arg("--log-dir")
+        .arg(log_directory);
     if let Some(program) = program {
         command.arg("--program").arg(program);
     }

@@ -77,9 +77,10 @@ three setup commands:
   same parser and semantic validation as runtime startup. It does not bind a
   listener, start Pingora, inspect launchd, or otherwise change system state.
 - `roused init-gateway-plist --label LABEL --config CONFIG --output OUTPUT
-  [--program PROGRAM]` generates the gateway
-  LaunchAgent described below. The label, configuration path, and output path
-  are required; the program path is optional.
+  [--log-dir DIRECTORY] [--program PROGRAM]`
+  generates the gateway LaunchAgent described below. The label, configuration
+  path, and output path are required; the log directory and program path are
+  optional.
 
 Both generators create only a new output and refuse to overwrite an existing
 file. The configuration generator prints a concise next step. Configuration
@@ -89,8 +90,13 @@ semantically invalid configuration, and argument errors produce a useful
 usage through `--help`.
 
 For gateway plist generation, `--config`, `--output`, and an explicit
-`--program` must be lexically absolute. Explicit path spelling is preserved,
-including a deliberately selected stable executable symlink. When `--program`
+`--log-dir` or `--program` must be lexically absolute. When `--log-dir` is
+omitted, Roused reads `HOME` from its command environment and selects
+`$HOME/Library/Logs`. An unavailable or non-absolute `HOME`, or a missing or
+non-directory default, produces a useful diagnostic, and the operator may
+select another existing directory explicitly. The selected log directory must
+exist and be a directory. Explicit program-path spelling is preserved so an
+operator can deliberately select a stable executable symlink. When `--program`
 is omitted, Roused derives an absolute path from its current executable. The
 configuration is validated through the normal loader before the output is
 created.
@@ -98,10 +104,16 @@ created.
 The plist is generated as structured, correctly escaped XML and contains the
 selected validated launchd `Label`, `ProgramArguments` consisting of the
 absolute program path followed by the absolute configuration path,
-`RunAtLoad=true`, and `KeepAlive=true`. This generator is the single source of
-truth for the Roused gateway plist; setup does not depend on a static packaged
-copy. Generation does not install or bootstrap the plist, invoke `launchctl`,
-or generate, inspect, edit, or repair any target-service plist.
+`StandardOutPath` set to `<log-dir>/<label>.stdout.log`, `StandardErrorPath`
+set to `<log-dir>/<label>.stderr.log`, `RunAtLoad=true`, and `KeepAlive=true`.
+Label-derived names prevent separately labeled gateway instances from sharing
+logs. This generator is the single source of truth for the Roused gateway
+plist; setup does not depend on a static packaged copy. Generation creates
+only the plist: it does not create log directories or files, probe directory
+writability, rotate or cap logs, install or bootstrap the plist, invoke
+`launchctl`, or generate, inspect, edit, or repair any target-service plist.
+Launchd creates missing log files when it starts the job, so the selected
+directory must be writable before bootstrapping.
 
 ## Routing and proxy semantics
 

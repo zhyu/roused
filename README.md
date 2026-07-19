@@ -128,7 +128,8 @@ The command interfaces are:
 roused <config.toml>
 roused init-config OUTPUT
 roused check-config CONFIG
-roused init-gateway-plist --label LABEL --config CONFIG --output OUTPUT [--program PROGRAM]
+roused init-gateway-plist --label LABEL --config CONFIG --output OUTPUT \
+  [--log-dir DIRECTORY] [--program PROGRAM]
 ```
 
 Use `roused --help` or a command's `--help` for concise usage information.
@@ -223,6 +224,7 @@ After the foreground smoke test succeeds, generate the gateway's current-user
 LaunchAgent plist at a new, absolute output path:
 
 ```sh
+/bin/mkdir -p "$HOME/Library/Logs"
 roused init-gateway-plist \
   --label net.example.roused \
   --config /absolute/path/to/roused.toml \
@@ -234,13 +236,38 @@ roused init-gateway-plist \
   "$HOME/Library/LaunchAgents/net.example.roused.plist"
 ```
 
-`--config`, `--output`, and an explicit `--program` must be written as lexical
-absolute paths. Their spelling is preserved, so `--program` can deliberately
-name a stable installed or Homebrew symlink. If `--program` is omitted, Roused
-derives the absolute path of its current executable. The command validates the
-configuration, safely escapes the generated XML, and refuses to overwrite an
-existing output. It generates only the selected gateway plist; it does not
-bootstrap it, invoke `launchctl`, or inspect or change target plists.
+`--config`, `--output`, and an explicit `--program` or `--log-dir` must be
+written as lexical absolute paths. With no `--log-dir`, Roused reads `HOME`
+from its command environment and uses `$HOME/Library/Logs`, the macOS
+user-domain log location appropriate for an unprivileged LaunchAgent.
+`/var/log` is a system location and is not used by this workflow. The selected
+directory must already exist. If `HOME` is unavailable or the default is
+missing or not a directory, the command reports the problem; pass `--log-dir`
+to select another existing directory. Explicit program-path spelling is
+preserved, so `--program` can deliberately name a stable installed or Homebrew
+symlink. If `--program` is omitted, Roused derives the absolute path of its
+current executable. The command validates the configuration, safely escapes
+the generated XML, and refuses to overwrite an existing output.
+
+The generated plist sends stdout to `<label>.stdout.log` and stderr to
+`<label>.stderr.log` inside the selected directory. Deriving the names from
+the launchd label keeps separately labeled gateway instances from sharing log
+files. Roused's INFO/WARN lifecycle logs—including wake attempts and results,
+stop-check outcomes and timeouts, and target-stop attempts and results—and
+startup diagnostics are written to stderr; stdout is captured separately.
+launchd creates missing log files when it starts the job. The generator
+creates only the selected plist: it does not create directories or log files,
+probe directory writability, bootstrap the job, invoke `launchctl`, or inspect
+or change target plists. Ensure the directory is writable before bootstrapping
+the plist. No automatic log rotation or size cap is configured. Follow the
+logs with:
+
+```sh
+/usr/bin/tail -F "$HOME/Library/Logs/net.example.roused.stderr.log"
+```
+
+When Roused runs in the foreground, its logs continue to appear on the
+terminal's stderr rather than in these launchd-selected files.
 
 The generated plist uses `RunAtLoad=true` and `KeepAlive=true`, so launchd
 starts and restarts the gateway after you bootstrap it manually. Restarting
@@ -264,6 +291,7 @@ gateway operations needs `sudo` or writes under `/Library`.
 | `421 Misdirected Request` | Confirm the request `Host` matches `services[].host`; an included port must equal the Roused listener port. |
 | A configuration edit has no effect | Restart Roused; configuration is loaded only at startup. |
 | A target never stops | Check for active requests or WebSockets, a vetoed/failed stop command, a target that ignores `SIGTERM`, or an incompatible launchd `KeepAlive` policy. |
+| The gateway does not start under launchd | Inspect `$HOME/Library/Logs/<label>.stderr.log` (or the selected override) and confirm that the log directory existed and was writable before bootstrapping the plist. |
 
 Roused logs service labels and lifecycle outcomes at INFO/WARN, but not request
 headers, response headers, credentials, or checker argv.

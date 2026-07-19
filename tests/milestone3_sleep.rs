@@ -678,8 +678,7 @@ impl GatewayLaunchAgentFixture {
         .expect("write gateway fixture configuration");
 
         let plist = directory.path().join("gateway.plist");
-        let stdout_log = directory.path().join("gateway.stdout");
-        let stderr_log = directory.path().join("gateway.stderr");
+        let stderr_log = directory.path().join(format!("{label}.stderr.log"));
         let binary = Path::new(env!("CARGO_BIN_EXE_roused"));
         let generated = Command::new(binary)
             .arg("init-gateway-plist")
@@ -691,6 +690,8 @@ impl GatewayLaunchAgentFixture {
             .arg(&plist)
             .arg("--program")
             .arg(binary)
+            .arg("--log-dir")
+            .arg(directory.path())
             .output()
             .expect("generate gateway fixture plist");
         assert!(
@@ -698,8 +699,6 @@ impl GatewayLaunchAgentFixture {
             "gateway plist generation failed: {}",
             String::from_utf8_lossy(&generated.stderr)
         );
-        insert_plist_string(&plist, "StandardOutPath", &stdout_log);
-        insert_plist_string(&plist, "StandardErrorPath", &stderr_log);
         assert_plist_is_valid(&plist);
 
         Self {
@@ -1122,21 +1121,6 @@ fn assert_plist_is_valid(path: &Path) {
         output.status.success(),
         "{} is not a valid plist: {}",
         path.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn insert_plist_string(plist: &Path, key: &str, value: &Path) {
-    let output = Command::new("/usr/bin/plutil")
-        .args(["-insert", key, "-string"])
-        .arg(value)
-        .arg(plist)
-        .output()
-        .expect("insert test-only plist value");
-    assert!(
-        output.status.success(),
-        "cannot insert {key} into {}: {}",
-        plist.display(),
         String::from_utf8_lossy(&output.stderr)
     );
 }

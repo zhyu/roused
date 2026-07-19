@@ -4,7 +4,7 @@ use pingora::server::configuration::ServerConf;
 use pingora::services::background::background_service;
 use roused::config::Config;
 use roused::proxy::RousedProxy;
-use roused::setup::gateway_plist_xml;
+use roused::setup::{SetupError, gateway_plist_xml};
 use std::env;
 use std::error::Error;
 use std::fs::OpenOptions;
@@ -59,6 +59,10 @@ enum CliCommand {
         #[arg(long, value_name = "OUTPUT.PLIST")]
         output: PathBuf,
 
+        /// Existing absolute log directory; defaults to $HOME/Library/Logs
+        #[arg(long, value_name = "DIRECTORY")]
+        log_dir: Option<PathBuf>,
+
         /// Absolute Roused executable path; defaults to this executable
         #[arg(long, value_name = "ROUSED")]
         program: Option<PathBuf>,
@@ -102,9 +106,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 label,
                 config,
                 output,
+                log_dir,
                 program,
             }),
-        ) => init_gateway_plist(&label, &config, &output, program),
+        ) => init_gateway_plist(&label, &config, &output, log_dir, program),
         (None, None) => unreachable!("clap requires a configuration path or subcommand"),
         (Some(_), Some(_)) => unreachable!("clap rejects mixed runtime and subcommand arguments"),
     }
@@ -135,6 +140,7 @@ fn init_gateway_plist(
     label: &str,
     config_path: &Path,
     output: &Path,
+    log_dir: Option<PathBuf>,
     program: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     if !output.is_absolute() {
@@ -145,9 +151,48 @@ fn init_gateway_plist(
         None => env::current_exe()
             .map_err(|error| format!("cannot determine the current executable path: {error}"))?,
     };
+    let uses_default_log_dir = log_dir.is_none();
+    let log_dir = match log_dir {
+        Some(log_dir) => log_dir,
+        None => {
+            let home = env::var_os("HOME").filter(|home| !home.is_empty()).ok_or(
+                "cannot determine the default log directory because HOME is not set; pass --log-dir",
+            )?;
+            let home = PathBuf::from(home);
+            if !home.is_absolute() {
+                return Err(
+                    "cannot determine the default log directory because HOME is not absolute; pass --log-dir"
+                        .into(),
+                );
+            }
+            home.join("Library/Logs")
+        }
+    };
 
     Config::load(config_path)?;
-    let contents = gateway_plist_xml(label, &program, config_path)?;
+    let contents = gateway_plist_xml(label, &program, config_path, &log_dir).map_err(
+        |error| -> Box<dyn Error> {
+            if uses_default_log_dir
+                && matches!(
+                    &error,
+                    SetupError::LogDirectoryUnavailable { .. }
+                        | SetupError::LogDirectoryNotDirectory { .. }
+                        | SetupError::PathNotUtf8 {
+                            name: "log directory",
+                            ..
+                        }
+                        | SetupError::InvalidXmlCharacter {
+                            name: "log directory",
+                            ..
+                        }
+                )
+            {
+                format!("{error}; pass --log-dir to select another directory").into()
+            } else {
+                Box::new(error)
+            }
+        },
+    )?;
     write_new(output, contents.as_bytes())?;
 
     println!("created gateway LaunchAgent plist at {}", output.display());
