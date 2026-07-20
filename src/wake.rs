@@ -26,7 +26,7 @@ enum LaunchState {
     CoolingDownUntil(Instant),
 }
 
-trait Launcher: Send + Sync {
+pub(crate) trait Launcher: Send + Sync {
     fn start(&self, target: Arc<WakeTarget>);
 }
 
@@ -60,7 +60,7 @@ impl WakeTarget {
         )
     }
 
-    fn with_launcher(
+    pub(crate) fn with_launcher(
         upstream: std::net::SocketAddr,
         launchd_label: String,
         user_id: u32,
@@ -93,6 +93,11 @@ impl WakeTarget {
     pub(crate) fn allow_launch_after_stop(&self) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         *state = LaunchState::Eligible;
+    }
+
+    pub(crate) fn launch_in_progress(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        matches!(*state, LaunchState::Launching)
     }
 
     fn request_launch_at(self: &Arc<Self>, now: Instant) {
@@ -228,9 +233,11 @@ mod tests {
             }
         });
         assert_eq!(launcher.calls.load(Ordering::SeqCst), 1);
+        assert!(target.launch_in_progress());
 
         let finished = Instant::now();
         target.launch_finished_at(finished);
+        assert!(!target.launch_in_progress());
         for offset in [
             Duration::ZERO,
             Duration::from_secs(1),

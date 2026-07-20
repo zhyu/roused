@@ -21,6 +21,8 @@ authentication.
    WebSocket connections finish.
 5. Once the target is idle, an optional external check may veto shutdown.
    Otherwise Roused asks launchd to deliver `SIGTERM`.
+6. When Roused itself receives `SIGTERM` or `SIGINT`, it performs one bounded,
+   best-effort cleanup pass over quiescent configured targets before exiting.
 
 ## Requirements and security warning
 
@@ -225,8 +227,8 @@ runs under launchd. Only exit status 0 permits shutdown. Failure, a nonzero
 status, or the fixed five-second timeout keeps the target running; while it
 remains idle, another check runs no sooner than 30 seconds later.
 
-After an allowed check and an atomic activity recheck, Roused makes this
-best-effort call:
+After an allowed check and an atomic activity recheck, Roused starts and awaits
+this best-effort call, with a fixed five-second timeout:
 
 ```text
 /bin/launchctl kill SIGTERM gui/$UID/<launchd_label>
@@ -236,6 +238,52 @@ This signals the job but does not unload it. If the target exits on `SIGTERM`
 and has `KeepAlive=false`, it remains stopped until a later request wakes it.
 Roused does not drain the target, escalate to `SIGKILL`, discover its PID, or
 repair its restart policy.
+
+### Gateway shutdown and restart
+
+`SIGTERM` and `SIGINT` start a coordinated gateway shutdown. Roused closes its
+request-admission gate, gives already-admitted requests and launch attempts up
+to five seconds to transfer into a service lease or finish, and gives each
+service lease the same deadline to drain. Parsed request headers that reach
+proxy handling after shutdown has started receive `503 Service Unavailable`,
+`Cache-Control: no-store`, nominal body `gateway shutting down\n` (omitted for
+HEAD), and a closed connection; connections the listener has already closed may
+instead fail before a response.
+
+Each configured service that becomes quiescent within the drain window gets one
+shutdown stop decision immediately, without waiting for its ordinary idle
+timeout. The services are handled concurrently. The optional
+`can_stop_command` still has its normal five-second timeout, and an allowed
+decision still receives an atomic activity and launch-state recheck before
+Roused awaits the five-second `launchctl kill SIGTERM` call. A stop attempt that
+was already running when gateway shutdown began is awaited rather than
+duplicated.
+
+This cleanup is intentionally conservative. A target remains running when its
+request or wake attempt does not drain in five seconds, its check vetoes, fails,
+or times out, an existing stop decision is invalidated by activity, or
+`launchctl` fails. Roused does not track which process first woke a job, so the
+cleanup candidate set is every configured label, including a target that was
+already running before this gateway process started.
+
+The gateway uses a 20-second graceful period and configures a two-second final
+runtime shutdown timeout; generated plists allow 30 seconds for the complete
+process exit. `SIGKILL`, a crash, or an unhandled terminating signal cannot run
+cleanup. If launchd restarts Roused after such an exit, the replacement
+does not scan processes or recover an old deadline; it creates fresh in-memory
+lifecycle state for every configured label. A surviving target is therefore
+managed under a fresh idle grace period, and later requests reset that new
+deadline normally.
+
+A service restart is indistinguishable from a permanent stop to the old
+gateway. In particular, `brew services restart roused` is a stop followed by a
+start, not a configuration reload signal. The old gateway cleans up quiescent
+targets; the replacement does not eagerly start them again. A target left
+running by conservative cleanup is adopted under the replacement gateway's
+fresh lifecycle state. Roused still does not reload configuration in place.
+`SIGQUIT` retains Pingora's graceful-upgrade signal path and also closes request
+admission and runs cleanup when Pingora broadcasts shutdown; it is not a
+Roused configuration-reload interface.
 
 ## Run Roused at login
 
@@ -268,10 +316,11 @@ symlink. If `--program` is omitted, Roused derives the absolute path of its
 current executable. The command validates the configuration, safely escapes
 the generated XML, and refuses to overwrite an existing output.
 
-The generated plist sends stdout to `<label>.stdout.log` and stderr to
-`<label>.stderr.log` inside the selected directory. Deriving the names from
-the launchd label keeps separately labeled gateway instances from sharing log
-files. Roused's INFO/WARN lifecycle logs—including wake attempts and results,
+The generated plist sets `ExitTimeOut=30`, giving the coordinated shutdown a
+deterministic launchd window before forced termination. It sends stdout to
+`<label>.stdout.log` and stderr to `<label>.stderr.log` inside the selected
+directory. Deriving the names from the launchd label keeps separately labeled
+gateway instances from sharing log files. Roused's INFO/WARN lifecycle logs—including wake attempts and results,
 stop-check outcomes and timeouts, and target-stop attempts and results—and
 startup diagnostics are written to stderr; stdout is captured separately.
 launchd creates missing log files when it starts the job. The generator
@@ -289,9 +338,10 @@ When Roused runs in the foreground, its logs continue to appear on the
 terminal's stderr rather than in these launchd-selected files.
 
 The generated plist uses `RunAtLoad=true` and `KeepAlive=true`, so launchd
-starts and restarts the gateway after you bootstrap it manually. Restarting
-Roused does not restart a target that is already listening; that target is
-proxied immediately and receives a fresh in-memory idle grace period.
+starts and restarts the gateway after you bootstrap it manually. A deliberate
+stop or restart first invokes the bounded cleanup described above. After a
+crash, any surviving configured target is adopted with a fresh in-memory idle
+grace period.
 
 To unload the generated gateway job, address its current-user service target:
 
@@ -308,7 +358,7 @@ gateway operations needs `sudo` or writes under `/Library`.
 | --- | --- |
 | Repeated `503` responses | Confirm the target job is bootstrapped in `gui/$UID`, its label matches the configuration, and it listens on the configured loopback socket after kickstart. |
 | `421 Misdirected Request` | Confirm the request `Host` matches `services[].host`; an included port must equal the Roused listener port. |
-| A configuration edit has no effect | Restart Roused; configuration is loaded only at startup. |
+| A configuration edit has no effect | Restart Roused; configuration is loaded only at startup. A restart performs the normal bounded target cleanup first. |
 | A target never stops | Check for active requests or WebSockets, a vetoed/failed stop command, a target that ignores `SIGTERM`, or an incompatible launchd `KeepAlive` policy. |
 | The gateway does not start under launchd | Inspect `$HOME/Library/Logs/<label>.stderr.log` (or the selected override) and confirm that the log directory existed and was writable before bootstrapping the plist. |
 

@@ -170,6 +170,23 @@ impl ProxyProcess {
             .map(|path| fs::read_to_string(path).expect("read proxy stderr capture"))
             .unwrap_or_default()
     }
+
+    pub fn send_signal(&self, signal: libc::c_int) {
+        // SAFETY: the child PID is live when the test sends the selected Unix signal.
+        let result = unsafe { libc::kill(self.child.id() as libc::pid_t, signal) };
+        assert_eq!(result, 0, "send signal {signal} to roused");
+    }
+
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll roused exit") {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "roused did not exit in time");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 impl Drop for ProxyProcess {

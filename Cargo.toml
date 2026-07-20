@@ -16,7 +16,7 @@ libc = "0.2.186"
 log = "0.4.29"
 pingora = { version = "=0.8.1", default-features = false, features = ["proxy"] }
 serde = { version = "1.0.228", features = ["derive"] }
-tokio = { version = "1.53.0", features = ["macros", "net", "process", "rt", "time"] }
+tokio = { version = "1.53.0", features = ["macros", "net", "process", "rt", "signal", "sync", "time"] }
 toml = "1.0.6"
 
 [dev-dependencies]

@@ -19,7 +19,9 @@ use support::{
 };
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(12);
+const GATEWAY_EXIT_TIMEOUT: Duration = Duration::from_secs(28);
 const SHORT_IDLE_SECONDS: u64 = 1;
+const LONG_IDLE_SECONDS: u64 = 60;
 const WAKE_SAFE_IDLE_SECONDS: u64 = 6;
 const STREAM_SEGMENT_BYTES: usize = 128 * 1024;
 
@@ -237,6 +239,7 @@ fn veto_is_rate_limited_until_activity_then_allow_permits_sigterm() {
     wait_for_checker_attempts(&check_log, 2);
     wait_for_log_value(&check_log, "allowed");
     wait_for_file_lines(&target.signal_log, 1, WAIT_TIMEOUT);
+    assert_eq!(file_lines(&target.signal_log), ["SIGTERM"]);
     target.wait_until_stopped();
 }
 
@@ -275,10 +278,14 @@ fn activity_during_a_stop_check_invalidates_its_allow_result() {
 
     thread::sleep(Duration::from_millis(400));
     target.assert_running_without_sigterm("activity during stop check");
+    wait_for_checker_attempts(&check_log, 2);
+    wait_for_file_lines(&target.signal_log, 1, WAIT_TIMEOUT);
+    assert_eq!(file_lines(&target.signal_log), ["SIGTERM"]);
+    target.wait_until_stopped();
 }
 
 #[test]
-fn failing_stop_check_keeps_the_target_running() {
+fn nonzero_stop_check_vetoes_and_keeps_the_target_running() {
     assert_unsuccessful_checker_keeps_target("failure", "stop check vetoed shutdown");
 }
 
@@ -317,7 +324,374 @@ fn missing_stop_check_keeps_the_target_running() {
 }
 
 #[test]
-fn launchd_restarts_the_gateway_and_restart_gives_a_running_target_fresh_grace() {
+fn foreground_sigterm_drains_a_request_then_cleans_up_before_exit() {
+    let mut target = TargetLaunchAgentFixture::new();
+    target.bootstrap();
+    target.kickstart();
+    target.wait_until_running(1);
+
+    let upstream = target.address;
+    let label = target.label.clone();
+    let mut proxy = ProxyProcess::spawn_with_stderr_capture(move |listen| {
+        service_configuration(
+            listen,
+            "sleep.apps.test",
+            upstream,
+            &label,
+            LONG_IDLE_SECONDS,
+            None,
+        )
+    });
+
+    let mut client = connect(proxy.address()).expect("connect held-response client");
+    client
+        .write_all(b"GET /hold-response HTTP/1.1\r\nHost: sleep.apps.test\r\n\r\n")
+        .expect("write held-response request");
+    client.flush().expect("flush held-response request");
+    let response = read_response_head(&mut client).expect("read held-response head");
+    let prefix = read_exact_with_prefix(&mut client, response.buffered_body, STREAM_SEGMENT_BYTES)
+        .expect("read held-response prefix");
+    assert_eq!(prefix, vec![b'R'; STREAM_SEGMENT_BYTES]);
+
+    proxy.send_signal(libc::SIGTERM);
+    thread::sleep(Duration::from_millis(300));
+    target.assert_running_without_sigterm("gateway request drain");
+    fs::write(&target.response_gate, b"release\n").expect("release held response");
+    let suffix = read_exact_with_prefix(&mut client, Vec::new(), STREAM_SEGMENT_BYTES)
+        .expect("read held-response suffix");
+    assert_eq!(suffix, vec![b'r'; STREAM_SEGMENT_BYTES]);
+    drop(client);
+
+    wait_for_file_lines(&target.signal_log, 1, WAIT_TIMEOUT);
+    assert_eq!(file_lines(&target.signal_log), ["SIGTERM"]);
+    target.wait_until_stopped();
+    let status = proxy.wait_for_exit(GATEWAY_EXIT_TIMEOUT);
+    assert!(status.success(), "SIGTERM gateway exit was {status}");
+    let stderr = proxy.stderr_contents();
+    assert!(stderr.contains("gateway received SIGTERM"), "{stderr}");
+    assert!(stderr.contains("launchctl stop completed"), "{stderr}");
+    assert!(
+        stderr.contains("gateway shutdown cleanup completed"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn foreground_sigint_runs_the_shutdown_checker_and_cleans_up_before_exit() {
+    let mut target = TargetLaunchAgentFixture::new();
+    target.bootstrap();
+    target.kickstart();
+    target.wait_until_running(1);
+    let mut second_target = TargetLaunchAgentFixture::new();
+    second_target.bootstrap();
+    second_target.kickstart();
+    second_target.wait_until_running(1);
+
+    let check_log = target.directory.path().join("shutdown-allow-check.log");
+    let allow = target.directory.path().join("allow-shutdown");
+    fs::write(&allow, b"allow\n").expect("allow shutdown checker");
+    let environment = checker_environment("state", &check_log, Some(&allow), None);
+    let checker = checker_command();
+    let upstream = target.address;
+    let label = target.label.clone();
+    let second_upstream = second_target.address;
+    let second_label = second_target.label.clone();
+    let mut proxy = ProxyProcess::spawn_with_stderr_capture_and_environment(
+        move |listen| {
+            let mut configuration = service_configuration(
+                listen,
+                "sleep.apps.test",
+                upstream,
+                &label,
+                LONG_IDLE_SECONDS,
+                Some(&checker),
+            );
+            configuration.push_str(&service_entry(
+                "second.apps.test",
+                second_upstream,
+                &second_label,
+                LONG_IDLE_SECONDS,
+                None,
+            ));
+            configuration
+        },
+        environment,
+    );
+
+    assert_eq!(request_ok(proxy.address(), "/before-sigint").status, 200);
+    proxy.send_signal(libc::SIGINT);
+    wait_for_checker_attempts(&check_log, 1);
+    wait_for_log_value(&check_log, "allowed");
+    wait_for_file_lines(&target.signal_log, 1, WAIT_TIMEOUT);
+    wait_for_file_lines(&second_target.signal_log, 1, WAIT_TIMEOUT);
+    assert_eq!(checker_attempts(&check_log), 1);
+    assert_eq!(file_lines(&target.signal_log), ["SIGTERM"]);
+    assert_eq!(file_lines(&second_target.signal_log), ["SIGTERM"]);
+    target.wait_until_stopped();
+    second_target.wait_until_stopped();
+    let status = proxy.wait_for_exit(GATEWAY_EXIT_TIMEOUT);
+    assert!(status.success(), "SIGINT gateway exit was {status}");
+    let stderr = proxy.stderr_contents();
+    assert!(stderr.contains("gateway received SIGINT"), "{stderr}");
+    assert!(
+        stderr.contains("gateway shutdown cleanup completed"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn shutdown_checker_veto_leaves_the_target_running() {
+    let mut target = TargetLaunchAgentFixture::new();
+    target.bootstrap();
+    target.kickstart();
+    target.wait_until_running(1);
+
+    let check_log = target.directory.path().join("shutdown-veto-check.log");
+    let allow = target.directory.path().join("allow-shutdown");
+    let environment = checker_environment("state", &check_log, Some(&allow), None);
+    let checker = checker_command();
+    let upstream = target.address;
+    let label = target.label.clone();
+    let mut proxy = ProxyProcess::spawn_with_stderr_capture_and_environment(
+        move |listen| {
+            service_configuration(
+                listen,
+                "sleep.apps.test",
+                upstream,
+                &label,
+                LONG_IDLE_SECONDS,
+                Some(&checker),
+            )
+        },
+        environment,
+    );
+
+    proxy.send_signal(libc::SIGTERM);
+    wait_for_checker_attempts(&check_log, 1);
+    wait_for_log_value(&check_log, "veto");
+    let status = proxy.wait_for_exit(GATEWAY_EXIT_TIMEOUT);
+    assert!(status.success(), "vetoed gateway exit was {status}");
+    assert_eq!(checker_attempts(&check_log), 1);
+    target.assert_running_without_sigterm("shutdown checker veto");
+    let stderr = proxy.stderr_contents();
+    assert!(stderr.contains("stop check vetoed shutdown"), "{stderr}");
+    assert!(
+        stderr.contains("gateway shutdown cleanup completed"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn shutdown_checker_timeout_is_bounded_and_leaves_the_target_running() {
+    let mut target = TargetLaunchAgentFixture::new();
+    target.bootstrap();
+    target.kickstart();
+    target.wait_until_running(1);
+
+    let check_log = target.directory.path().join("shutdown-timeout-check.log");
+    let environment = checker_environment("timeout", &check_log, None, None);
+    let checker = checker_command();
+    let upstream = target.address;
+    let label = target.label.clone();
+    let mut proxy = ProxyProcess::spawn_with_stderr_capture_and_environment(
+        move |listen| {
+            service_configuration(
+                listen,
+                "sleep.apps.test",
+                upstream,
+                &label,
+                LONG_IDLE_SECONDS,
+                Some(&checker),
+            )
+        },
+        environment,
+    );
+
+    proxy.send_signal(libc::SIGTERM);
+    wait_for_checker_attempts(&check_log, 1);
+    wait_for_proxy_log(&proxy, "stop check timed out");
+    let status = proxy.wait_for_exit(GATEWAY_EXIT_TIMEOUT);
+    assert!(
+        status.success(),
+        "checker-timeout gateway exit was {status}"
+    );
+    assert_eq!(checker_attempts(&check_log), 1);
+    target.assert_running_without_sigterm("shutdown checker timeout");
+}
+
+#[test]
+fn launchctl_failure_is_observed_before_gateway_shutdown_completes() {
+    let upstream = unused_loopback_address();
+    let missing_label = format!("com.openai.roused.test.missing.{}", unique_token());
+    let mut proxy = ProxyProcess::spawn_with_stderr_capture(move |listen| {
+        service_configuration(
+            listen,
+            "sleep.apps.test",
+            upstream,
+            &missing_label,
+            LONG_IDLE_SECONDS,
+            None,
+        )
+    });
+
+    proxy.send_signal(libc::SIGTERM);
+    let status = proxy.wait_for_exit(GATEWAY_EXIT_TIMEOUT);
+    assert!(
+        status.success(),
+        "launchctl-failure gateway exit was {status}"
+    );
+    let stderr = proxy.stderr_contents();
+    let failed = stderr
+        .find("launchctl stop failed for configured service")
+        .unwrap_or_else(|| panic!("missing launchctl failure log: {stderr}"));
+    let cleanup_completed = stderr
+        .find("gateway shutdown cleanup completed")
+        .unwrap_or_else(|| panic!("missing cleanup completion log: {stderr}"));
+    assert!(failed < cleanup_completed, "{stderr}");
+}
+
+#[test]
+fn request_exceeding_shutdown_drain_timeout_leaves_the_target_running() {
+    let mut target = TargetLaunchAgentFixture::new();
+    target.bootstrap();
+    target.kickstart();
+    target.wait_until_running(1);
+    let mut quiescent_target = TargetLaunchAgentFixture::new();
+    quiescent_target.bootstrap();
+    quiescent_target.kickstart();
+    quiescent_target.wait_until_running(1);
+
+    let upstream = target.address;
+    let label = target.label.clone();
+    let quiescent_upstream = quiescent_target.address;
+    let quiescent_label = quiescent_target.label.clone();
+    let mut proxy = ProxyProcess::spawn_with_stderr_capture(move |listen| {
+        let mut configuration = service_configuration(
+            listen,
+            "sleep.apps.test",
+            upstream,
+            &label,
+            LONG_IDLE_SECONDS,
+            None,
+        );
+        configuration.push_str(&service_entry(
+            "quiescent.apps.test",
+            quiescent_upstream,
+            &quiescent_label,
+            LONG_IDLE_SECONDS,
+            None,
+        ));
+        configuration
+    });
+    let mut client = connect(proxy.address()).expect("connect held-response client");
+    client
+        .write_all(b"GET /hold-response HTTP/1.1\r\nHost: sleep.apps.test\r\n\r\n")
+        .expect("write held-response request");
+    client.flush().expect("flush held-response request");
+    let response = read_response_head(&mut client).expect("read held-response head");
+    let prefix = read_exact_with_prefix(&mut client, response.buffered_body, STREAM_SEGMENT_BYTES)
+        .expect("read held-response prefix");
+    assert_eq!(prefix, vec![b'R'; STREAM_SEGMENT_BYTES]);
+
+    proxy.send_signal(libc::SIGTERM);
+    wait_for_file_lines(&quiescent_target.signal_log, 1, WAIT_TIMEOUT);
+    assert_eq!(file_lines(&quiescent_target.signal_log), ["SIGTERM"]);
+    quiescent_target.wait_until_stopped();
+    wait_for_proxy_log(&proxy, "did not drain in time");
+    target.assert_running_without_sigterm("expired gateway request drain");
+    fs::write(&target.response_gate, b"release\n").expect("release held response");
+    let suffix = read_exact_with_prefix(&mut client, Vec::new(), STREAM_SEGMENT_BYTES)
+        .expect("read held-response suffix");
+    assert_eq!(suffix, vec![b'r'; STREAM_SEGMENT_BYTES]);
+    drop(client);
+
+    let status = proxy.wait_for_exit(GATEWAY_EXIT_TIMEOUT);
+    assert!(status.success(), "drain-timeout gateway exit was {status}");
+    target.assert_running_without_sigterm("gateway exit after drain timeout");
+}
+
+#[test]
+fn cold_wake_immediately_before_shutdown_is_cleaned_up() {
+    let mut target = TargetLaunchAgentFixture::new();
+    target.bootstrap();
+    assert!(target.job_pid().is_none(), "RunAtLoad=false target started");
+
+    let upstream = target.address;
+    let label = target.label.clone();
+    let mut proxy = ProxyProcess::spawn_with_stderr_capture(move |listen| {
+        service_configuration(
+            listen,
+            "sleep.apps.test",
+            upstream,
+            &label,
+            LONG_IDLE_SECONDS,
+            None,
+        )
+    });
+
+    assert_eq!(
+        request_ok(proxy.address(), "/cold-before-shutdown").status,
+        503
+    );
+    proxy.send_signal(libc::SIGTERM);
+    wait_for_file_lines(&target.start_log, 1, WAIT_TIMEOUT);
+    wait_for_file_lines(&target.signal_log, 1, WAIT_TIMEOUT);
+    assert_eq!(file_lines(&target.start_log), ["started"]);
+    assert_eq!(file_lines(&target.signal_log), ["SIGTERM"]);
+    target.wait_until_stopped();
+    let status = proxy.wait_for_exit(GATEWAY_EXIT_TIMEOUT);
+    assert!(status.success(), "cold-wake gateway exit was {status}");
+    let stderr = proxy.stderr_contents();
+    assert!(stderr.contains("launchctl kickstart completed"), "{stderr}");
+    assert!(stderr.contains("launchctl stop completed"), "{stderr}");
+}
+
+#[test]
+fn shutdown_awaits_an_existing_stop_check_without_duplicating_it() {
+    let mut target = TargetLaunchAgentFixture::new();
+    target.bootstrap();
+    target.kickstart();
+    target.wait_until_running(1);
+
+    let check_log = target.directory.path().join("shutdown-existing-check.log");
+    let release = target.directory.path().join("release-shutdown-check");
+    let environment = checker_environment("blocked", &check_log, None, Some(&release));
+    let checker = checker_command();
+    let upstream = target.address;
+    let label = target.label.clone();
+    let mut proxy = ProxyProcess::spawn_with_stderr_capture_and_environment(
+        move |listen| {
+            service_configuration(
+                listen,
+                "sleep.apps.test",
+                upstream,
+                &label,
+                SHORT_IDLE_SECONDS,
+                Some(&checker),
+            )
+        },
+        environment,
+    );
+
+    assert_eq!(
+        request_ok(proxy.address(), "/before-existing-check").status,
+        200
+    );
+    wait_for_checker_attempts(&check_log, 1);
+    proxy.send_signal(libc::SIGTERM);
+    wait_for_proxy_log(&proxy, "awaiting an existing stop attempt");
+    fs::write(&release, b"release\n").expect("release existing shutdown check");
+    wait_for_log_value(&check_log, "allowed");
+    wait_for_file_lines(&target.signal_log, 1, WAIT_TIMEOUT);
+    assert_eq!(checker_attempts(&check_log), 1);
+    assert_eq!(file_lines(&target.signal_log), ["SIGTERM"]);
+    target.wait_until_stopped();
+    let status = proxy.wait_for_exit(GATEWAY_EXIT_TIMEOUT);
+    assert!(status.success(), "existing-check gateway exit was {status}");
+}
+
+#[test]
+fn launchd_restarts_after_gateway_crash_and_adopts_target_until_fresh_timeout() {
     let mut target = TargetLaunchAgentFixture::new();
     target.bootstrap();
     target.kickstart();
@@ -351,12 +725,73 @@ fn launchd_restarts_the_gateway_and_restart_gives_a_running_target_fresh_grace()
     assert_eq!(target.job_pid(), Some(target_pid));
     assert!(file_lines(&target.signal_log).is_empty());
 
+    wait_for_file_lines(
+        &target.signal_log,
+        1,
+        Duration::from_secs(WAKE_SAFE_IDLE_SECONDS + 5),
+    );
+    assert_eq!(file_lines(&target.signal_log), ["SIGTERM"]);
+    target.wait_until_stopped();
+    assert_eq!(file_lines(&target.start_log), ["started"]);
+    assert!(
+        !gateway
+            .stderr_contents()
+            .contains("launchctl kickstart started"),
+        "already-running target was kickstarted after gateway restart"
+    );
+}
+
+#[test]
+fn activity_after_gateway_crash_resets_the_replacement_lifecycle_timeout() {
+    let mut target = TargetLaunchAgentFixture::new();
+    target.bootstrap();
+    target.kickstart();
+    target.wait_until_running(1);
+    let target_pid = target.job_pid().expect("running target pid");
+
+    let mut gateway = GatewayLaunchAgentFixture::new(&target, WAKE_SAFE_IDLE_SECONDS);
+    gateway.bootstrap();
+    gateway.wait_until_running();
+    let old_gateway_pid = gateway.job_pid().expect("gateway pid before kill");
+
+    assert_eq!(
+        send_request(
+            gateway.address,
+            b"GET /before-gateway-crash HTTP/1.1\r\nHost: gateway.apps.test\r\n\r\n",
+        )
+        .expect("request through gateway LaunchAgent")
+        .status,
+        200
+    );
+    thread::sleep(Duration::from_secs(1));
+    gateway.kill();
+    gateway.wait_for_different_pid(old_gateway_pid);
+    let restart_observed = Instant::now();
+
+    thread::sleep(Duration::from_secs(3));
     let after_restart = send_request(
         gateway.address,
         b"GET /after-gateway-restart HTTP/1.1\r\nHost: gateway.apps.test\r\n\r\n",
     )
     .expect("request through restarted gateway");
     assert_eq!(after_restart.status, 200);
+    let replacement_activity = Instant::now();
+
+    wait_until(restart_observed + Duration::from_secs(WAKE_SAFE_IDLE_SECONDS + 1));
+    assert!(
+        replacement_activity.elapsed() < Duration::from_secs(WAKE_SAFE_IDLE_SECONDS),
+        "post-restart request did not leave a meaningful reset idle period"
+    );
+    assert_eq!(target.job_pid(), Some(target_pid));
+    assert!(file_lines(&target.signal_log).is_empty());
+
+    wait_for_file_lines(
+        &target.signal_log,
+        1,
+        Duration::from_secs(WAKE_SAFE_IDLE_SECONDS + 5),
+    );
+    assert_eq!(file_lines(&target.signal_log), ["SIGTERM"]);
+    target.wait_until_stopped();
     assert_eq!(file_lines(&target.start_log), ["started"]);
     assert!(
         !gateway
@@ -864,9 +1299,22 @@ fn service_configuration(
     idle_timeout_seconds: u64,
     checker: Option<&[String]>,
 ) -> String {
-    let mut configuration = format!(
-        "listen = {}\n\n[[services]]\nhost = {}\nupstream = {}\nlaunchd_label = {}\nidle_timeout_seconds = {idle_timeout_seconds}\n",
+    format!(
+        "listen = {}\n{}",
         toml_string(&listen.to_string()),
+        service_entry(host, upstream, launchd_label, idle_timeout_seconds, checker,)
+    )
+}
+
+fn service_entry(
+    host: &str,
+    upstream: SocketAddr,
+    launchd_label: &str,
+    idle_timeout_seconds: u64,
+    checker: Option<&[String]>,
+) -> String {
+    let mut entry = format!(
+        "\n[[services]]\nhost = {}\nupstream = {}\nlaunchd_label = {}\nidle_timeout_seconds = {idle_timeout_seconds}\n",
         toml_string(host),
         toml_string(&upstream.to_string()),
         toml_string(launchd_label),
@@ -877,9 +1325,9 @@ fn service_configuration(
             .map(|argument| toml_string(argument))
             .collect::<Vec<_>>()
             .join(", ");
-        configuration.push_str(&format!("can_stop_command = [{checker}]\n"));
+        entry.push_str(&format!("can_stop_command = [{checker}]\n"));
     }
-    configuration
+    entry
 }
 
 fn toml_string(value: &str) -> String {

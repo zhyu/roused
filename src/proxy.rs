@@ -1,5 +1,7 @@
 use crate::config::{Config, normalize_request_host};
-use crate::lifecycle::{IdleMonitor, ServiceLease, ServiceLifecycle};
+use crate::lifecycle::{
+    IdleMonitor, RequestAdmission, RequestGate, ServiceLease, ServiceLifecycle,
+};
 use crate::wake::{WakeTarget, current_user_id};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -16,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const UNKNOWN_HOST_BODY: &[u8] = b"unknown host\n";
+const SHUTTING_DOWN_BODY: &[u8] = b"gateway shutting down\n";
 const LOADING_HTML_BODY: &[u8] = b"<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"5\"><title>Loading</title></head><body>Service is starting.</body></html>\n";
 const LOADING_JSON_BODY: &[u8] = b"{\"status\":\"loading\",\"retry_after\":5}\n";
 
@@ -23,12 +26,25 @@ pub struct RousedProxy {
     listener_port: u16,
     routes: HashMap<String, Arc<ServiceRoute>>,
     idle_monitor: IdleMonitor,
+    request_gate: Arc<RequestGate>,
 }
 
-#[derive(Default)]
+#[derive(Clone)]
+pub struct GatewayShutdownHandle {
+    request_gate: Arc<RequestGate>,
+}
+
+impl GatewayShutdownHandle {
+    pub fn begin_shutdown(&self) {
+        self.request_gate.close();
+    }
+}
+
 pub struct RequestContext {
     route: Option<Arc<ServiceRoute>>,
     lease: Option<ServiceLease>,
+    admission: Option<RequestAdmission>,
+    rejected_for_shutdown: bool,
     websocket: bool,
 }
 
@@ -40,6 +56,7 @@ struct ServiceRoute {
 impl RousedProxy {
     pub fn new(config: &Config) -> Self {
         let user_id = current_user_id();
+        let request_gate = RequestGate::new();
         let mut lifecycles = Vec::new();
         let routes = config
             .services()
@@ -66,7 +83,8 @@ impl RousedProxy {
         Self {
             listener_port: config.listen().port(),
             routes,
-            idle_monitor: IdleMonitor::new(lifecycles),
+            idle_monitor: IdleMonitor::new(lifecycles, Arc::clone(&request_gate)),
+            request_gate,
         }
     }
 
@@ -75,6 +93,12 @@ impl RousedProxy {
     ) -> impl pingora::services::background::BackgroundService + Clone + use<> {
         self.idle_monitor.clone()
     }
+
+    pub fn shutdown_handle(&self) -> GatewayShutdownHandle {
+        GatewayShutdownHandle {
+            request_gate: Arc::clone(&self.request_gate),
+        }
+    }
 }
 
 #[async_trait]
@@ -82,10 +106,21 @@ impl ProxyHttp for RousedProxy {
     type CTX = RequestContext;
 
     fn new_ctx(&self) -> Self::CTX {
-        RequestContext::default()
+        let admission = self.request_gate.admit();
+        RequestContext {
+            route: None,
+            lease: None,
+            rejected_for_shutdown: admission.is_none(),
+            admission,
+            websocket: false,
+        }
     }
 
     async fn request_filter(&self, session: &mut Session, context: &mut Self::CTX) -> Result<bool> {
+        if context.rejected_for_shutdown {
+            write_shutting_down(session).await?;
+            return Ok(true);
+        }
         context.websocket = is_valid_websocket_request(session.req_header());
         let route = session
             .req_header()
@@ -96,6 +131,7 @@ impl ProxyHttp for RousedProxy {
             .and_then(|host| self.routes.get(&host).cloned());
 
         let Some(route) = route else {
+            drop(context.admission.take());
             write_unknown_host(session).await?;
             return Ok(true);
         };
@@ -107,6 +143,7 @@ impl ProxyHttp for RousedProxy {
         }
 
         route.wake.request_launch();
+        drop(context.admission.take());
         write_loading_response(session).await?;
         Ok(true)
     }
@@ -126,6 +163,7 @@ impl ProxyHttp for RousedProxy {
             ));
         }
         context.lease = Some(route.lifecycle.acquire());
+        drop(context.admission.take());
         Ok(true)
     }
 
@@ -181,12 +219,33 @@ impl ProxyHttp for RousedProxy {
         context: &mut Self::CTX,
     ) {
         drop(context.lease.take());
+        drop(context.admission.take());
     }
 
     fn request_summary(&self, _session: &Session, _context: &Self::CTX) -> String {
         // Pingora's default includes Host. Keep all request headers, query
         // credentials, and body tokens out of supported logs.
         "proxied request".to_owned()
+    }
+}
+
+async fn write_shutting_down(session: &mut Session) -> Result<()> {
+    let head = session.req_header().method == Method::HEAD;
+    let mut response = ResponseHeader::build(503, Some(3))?;
+    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+    response.insert_header("Cache-Control", "no-store")?;
+    response.insert_header(CONTENT_LENGTH, SHUTTING_DOWN_BODY.len().to_string())?;
+
+    session.as_downstream_mut().set_keepalive(None);
+    session
+        .write_response_header(Box::new(response), head)
+        .await?;
+    if head {
+        Ok(())
+    } else {
+        session
+            .write_response_body(Some(Bytes::from_static(SHUTTING_DOWN_BODY)), true)
+            .await
     }
 }
 

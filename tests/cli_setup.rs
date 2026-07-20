@@ -180,6 +180,7 @@ fn init_gateway_plist_generates_escaped_lintable_structured_output() {
     );
     assert_eq!(plist_raw(&output_path, "RunAtLoad"), "true");
     assert_eq!(plist_raw(&output_path, "KeepAlive"), "true");
+    assert_eq!(plist_raw(&output_path, "ExitTimeOut"), "30");
     assert_eq!(
         plist_raw(&output_path, "StandardOutPath"),
         stdout_log_path

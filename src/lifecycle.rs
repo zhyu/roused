@@ -5,13 +5,34 @@ use pingora::services::background::BackgroundService;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::process::Command;
-use tokio::time::{MissedTickBehavior, interval, timeout};
+use tokio::process::{Child, Command};
+use tokio::sync::Notify;
+use tokio::task::JoinSet;
+use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 
 const LAUNCHCTL_PATH: &str = "/bin/launchctl";
 const IDLE_SCAN_INTERVAL: Duration = Duration::from_millis(100);
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 pub(crate) const STOP_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const STOP_CHECK_RETRY: Duration = Duration::from_secs(30);
+pub(crate) const STOP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(crate) struct RequestGate {
+    state: Mutex<RequestGateState>,
+    changed: Notify,
+}
+
+#[derive(Debug)]
+struct RequestGateState {
+    accepting: bool,
+    admitted: usize,
+}
+
+pub(crate) struct RequestAdmission {
+    gate: Arc<RequestGate>,
+    released: bool,
+}
 
 pub(crate) struct ServiceLifecycle {
     launchd_label: String,
@@ -41,12 +62,28 @@ pub(crate) struct ServiceLease {
 #[derive(Clone)]
 pub(crate) struct IdleMonitor {
     services: Vec<Arc<ServiceLifecycle>>,
+    request_gate: Arc<RequestGate>,
 }
 
 #[derive(Debug)]
 struct StopAttempt {
     generation: u64,
     can_stop_command: Option<Vec<String>>,
+    requires_idle_timeout: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ShutdownPreparation {
+    CleanupNeeded,
+    ExistingAttempt,
+    AlreadySignalled,
+}
+
+#[derive(Debug)]
+enum ShutdownAttempt {
+    Ready(StopAttempt),
+    Busy,
+    AlreadySignalled,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -68,6 +105,100 @@ struct StopCheckSpec {
 struct StopCommandSpec {
     program: &'static str,
     arguments: [String; 3],
+    timeout: Duration,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum StopCommandOutcome {
+    Succeeded,
+    Failed,
+    TimedOut,
+}
+
+enum StopStart<T> {
+    Started(T),
+    Obsolete,
+    Failed,
+}
+
+impl RequestGate {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(RequestGateState {
+                accepting: true,
+                admitted: 0,
+            }),
+            changed: Notify::new(),
+        })
+    }
+
+    pub(crate) fn admit(self: &Arc<Self>) -> Option<RequestAdmission> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !state.accepting {
+            return None;
+        }
+        state.admitted = state
+            .admitted
+            .checked_add(1)
+            .expect("request admission count overflowed");
+        drop(state);
+        Some(RequestAdmission {
+            gate: Arc::clone(self),
+            released: false,
+        })
+    }
+
+    pub(crate) fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.accepting = false;
+        let drained = state.admitted == 0;
+        drop(state);
+        if drained {
+            self.changed.notify_one();
+        }
+    }
+
+    async fn wait_for_drain_until(&self, deadline: Instant) -> bool {
+        loop {
+            let changed = self.changed.notified();
+            let drained = {
+                let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                state.admitted == 0
+            };
+            if drained {
+                return true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            if timeout(remaining, changed).await.is_err() {
+                let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                return state.admitted == 0;
+            }
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.admitted = state
+            .admitted
+            .checked_sub(1)
+            .expect("request admission released without an admitted request");
+        let drained = state.admitted == 0;
+        drop(state);
+        if drained {
+            self.changed.notify_one();
+        }
+    }
+}
+
+impl Drop for RequestAdmission {
+    fn drop(&mut self) {
+        if !self.released {
+            self.gate.release();
+            self.released = true;
+        }
+    }
 }
 
 impl ServiceLifecycle {
@@ -163,6 +294,7 @@ impl ServiceLifecycle {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state.in_flight != 0
             || state.attempt_in_progress
+            || self.wake_target.launch_in_progress()
             || now.saturating_duration_since(state.idle_since) < self.idle_timeout
             || state.stop_attempted_generation == Some(state.generation)
             || state
@@ -176,6 +308,38 @@ impl ServiceLifecycle {
         Some(StopAttempt {
             generation: state.generation,
             can_stop_command: self.can_stop_command.clone(),
+            requires_idle_timeout: true,
+        })
+    }
+
+    fn prepare_shutdown(&self) -> ShutdownPreparation {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.attempt_in_progress {
+            ShutdownPreparation::ExistingAttempt
+        } else if state.stop_attempted_generation == Some(state.generation) {
+            ShutdownPreparation::AlreadySignalled
+        } else {
+            ShutdownPreparation::CleanupNeeded
+        }
+    }
+
+    fn begin_shutdown_attempt(&self) -> ShutdownAttempt {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.stop_attempted_generation == Some(state.generation) {
+            return ShutdownAttempt::AlreadySignalled;
+        }
+        if state.in_flight != 0
+            || state.attempt_in_progress
+            || self.wake_target.launch_in_progress()
+        {
+            return ShutdownAttempt::Busy;
+        }
+
+        state.attempt_in_progress = true;
+        ShutdownAttempt::Ready(StopAttempt {
+            generation: state.generation,
+            can_stop_command: self.can_stop_command.clone(),
+            requires_idle_timeout: false,
         })
     }
 
@@ -187,33 +351,52 @@ impl ServiceLifecycle {
         }
     }
 
-    fn finish_allowed_attempt_at<F>(
+    fn start_allowed_attempt_at<T, F>(
         &self,
         attempt: &StopAttempt,
         now: Instant,
         start_stop: F,
-    ) -> bool
+    ) -> StopStart<T>
     where
-        F: FnOnce() -> bool,
+        F: FnOnce() -> Option<T>,
     {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        state.attempt_in_progress = false;
         if state.generation != attempt.generation
             || state.in_flight != 0
-            || now.saturating_duration_since(state.idle_since) < self.idle_timeout
+            || self.wake_target.launch_in_progress()
+            || (attempt.requires_idle_timeout
+                && now.saturating_duration_since(state.idle_since) < self.idle_timeout)
         {
-            return false;
+            state.attempt_in_progress = false;
+            return StopStart::Obsolete;
         }
 
-        if start_stop() {
+        if let Some(child) = start_stop() {
             // This separate launch-state lock is always taken after the lifecycle
             // lock, matching the request path's lifecycle-then-wake ordering.
             self.wake_target.allow_launch_after_stop();
             state.stop_attempted_generation = Some(state.generation);
-            true
+            StopStart::Started(child)
         } else {
+            state.attempt_in_progress = false;
             state.last_check_finished = Some(now);
-            false
+            StopStart::Failed
+        }
+    }
+
+    fn finish_stop_command_at(
+        &self,
+        attempt: &StopAttempt,
+        outcome: &StopCommandOutcome,
+        now: Instant,
+    ) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.attempt_in_progress = false;
+        if *outcome != StopCommandOutcome::Succeeded && state.generation == attempt.generation {
+            if state.stop_attempted_generation == Some(attempt.generation) {
+                state.stop_attempted_generation = None;
+            }
+            state.last_check_finished = Some(now);
         }
     }
 
@@ -236,6 +419,7 @@ impl ServiceLifecycle {
                 "SIGTERM".to_owned(),
                 format!("gui/{}/{}", self.user_id, self.launchd_label),
             ],
+            timeout: STOP_COMMAND_TIMEOUT,
         }
     }
 
@@ -250,15 +434,39 @@ impl ServiceLifecycle {
         match outcome {
             StopCheckOutcome::Allowed => {
                 let spec = self.stop_command_spec();
-                let label = self.launchd_label.clone();
-                let stopped = self.finish_allowed_attempt_at(&attempt, Instant::now(), || {
-                    start_stop_command(spec, label)
-                });
-                if !stopped {
-                    log::info!(
+                match self.start_allowed_attempt_at(&attempt, Instant::now(), || {
+                    start_stop_command(&spec)
+                }) {
+                    StopStart::Started(child) => {
+                        log::info!(
+                            "launchctl stop started for configured service {}",
+                            self.launchd_label
+                        );
+                        let outcome = finish_stop_command(child, spec.timeout).await;
+                        self.finish_stop_command_at(&attempt, &outcome, Instant::now());
+                        match outcome {
+                            StopCommandOutcome::Succeeded => log::info!(
+                                "launchctl stop completed for configured service {}",
+                                self.launchd_label
+                            ),
+                            StopCommandOutcome::Failed => log::warn!(
+                                "launchctl stop failed for configured service {}",
+                                self.launchd_label
+                            ),
+                            StopCommandOutcome::TimedOut => log::warn!(
+                                "launchctl stop timed out for configured service {}",
+                                self.launchd_label
+                            ),
+                        }
+                    }
+                    StopStart::Obsolete => log::info!(
                         "obsolete stop decision discarded for configured service {}",
                         self.launchd_label
-                    );
+                    ),
+                    StopStart::Failed => log::warn!(
+                        "launchctl stop failed to start for configured service {}",
+                        self.launchd_label
+                    ),
                 }
             }
             StopCheckOutcome::Vetoed => {
@@ -302,16 +510,61 @@ impl Drop for ServiceLease {
 }
 
 impl IdleMonitor {
-    pub(crate) fn new(services: Vec<Arc<ServiceLifecycle>>) -> Self {
-        Self { services }
+    pub(crate) fn new(
+        services: Vec<Arc<ServiceLifecycle>>,
+        request_gate: Arc<RequestGate>,
+    ) -> Self {
+        Self {
+            services,
+            request_gate,
+        }
     }
 
-    fn scan_at(&self, now: Instant) {
-        for service in &self.services {
-            if let Some(attempt) = service.begin_stop_attempt_at(now) {
-                tokio::spawn(Arc::clone(service).run_stop_attempt(attempt));
+    fn scan_at(&self, now: Instant, attempts: &mut JoinSet<()>) {
+        while let Some(result) = attempts.try_join_next() {
+            if let Err(error) = result {
+                log::warn!("configured-service stop task failed: {error}");
             }
         }
+        for service in &self.services {
+            if let Some(attempt) = service.begin_stop_attempt_at(now) {
+                attempts.spawn(Arc::clone(service).run_stop_attempt(attempt));
+            }
+        }
+    }
+
+    async fn cleanup_at_shutdown(&self, attempts: &mut JoinSet<()>) {
+        log::info!("gateway shutdown cleanup started");
+        self.request_gate.close();
+        let deadline = Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+        if !self.request_gate.wait_for_drain_until(deadline).await {
+            log::warn!(
+                "gateway shutdown cleanup left configured services running because request admission did not drain"
+            );
+        } else {
+            for service in &self.services {
+                match service.prepare_shutdown() {
+                    ShutdownPreparation::CleanupNeeded => {
+                        attempts.spawn(cleanup_service_at_shutdown(Arc::clone(service), deadline));
+                    }
+                    ShutdownPreparation::ExistingAttempt => log::info!(
+                        "gateway shutdown cleanup is awaiting an existing stop attempt for configured service {}",
+                        service.launchd_label
+                    ),
+                    ShutdownPreparation::AlreadySignalled => log::info!(
+                        "gateway shutdown cleanup did not duplicate an accepted stop for configured service {}",
+                        service.launchd_label
+                    ),
+                }
+            }
+        }
+
+        while let Some(result) = attempts.join_next().await {
+            if let Err(error) = result {
+                log::warn!("configured-service stop task failed: {error}");
+            }
+        }
+        log::info!("gateway shutdown cleanup completed");
     }
 }
 
@@ -320,11 +573,41 @@ impl BackgroundService for IdleMonitor {
     async fn start(&self, mut shutdown: ShutdownWatch) {
         let mut scan = interval(IDLE_SCAN_INTERVAL);
         scan.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut attempts = JoinSet::new();
         loop {
             tokio::select! {
-                _ = shutdown.changed() => break,
-                _ = scan.tick() => self.scan_at(Instant::now()),
+                _ = shutdown.changed() => {
+                    self.cleanup_at_shutdown(&mut attempts).await;
+                    break;
+                },
+                _ = scan.tick() => self.scan_at(Instant::now(), &mut attempts),
             }
+        }
+    }
+}
+
+async fn cleanup_service_at_shutdown(service: Arc<ServiceLifecycle>, deadline: Instant) {
+    loop {
+        match service.begin_shutdown_attempt() {
+            ShutdownAttempt::Ready(attempt) => {
+                Arc::clone(&service).run_stop_attempt(attempt).await;
+                return;
+            }
+            ShutdownAttempt::AlreadySignalled => {
+                log::info!(
+                    "gateway shutdown cleanup did not duplicate an accepted stop for configured service {}",
+                    service.launchd_label
+                );
+                return;
+            }
+            ShutdownAttempt::Busy if Instant::now() >= deadline => {
+                log::warn!(
+                    "gateway shutdown cleanup left configured service {} running because it did not drain in time",
+                    service.launchd_label
+                );
+                return;
+            }
+            ShutdownAttempt::Busy => sleep(SHUTDOWN_POLL_INTERVAL).await,
         }
     }
 }
@@ -346,51 +629,51 @@ async fn run_stop_check(spec: StopCheckSpec) -> StopCheckOutcome {
         Ok(Ok(_)) => StopCheckOutcome::Vetoed,
         Ok(Err(_)) => StopCheckOutcome::Failed,
         Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            terminate_timed_out_child(&mut child).await;
             StopCheckOutcome::TimedOut
         }
     }
 }
 
-fn start_stop_command(spec: StopCommandSpec, launchd_label: String) -> bool {
+fn start_stop_command(spec: &StopCommandSpec) -> Option<Child> {
     let mut command = Command::new(spec.program);
     command
-        .args(spec.arguments)
+        .args(&spec.arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
 
-    let Ok(mut child) = command.spawn() else {
-        log::warn!(
-            "launchctl stop failed to start for configured service {}",
-            launchd_label
-        );
-        return false;
-    };
-    log::info!(
-        "launchctl stop started for configured service {}",
-        launchd_label
-    );
-    tokio::spawn(async move {
-        match child.wait().await {
-            Ok(status) if status.success() => log::info!(
-                "launchctl stop completed for configured service {}",
-                launchd_label
-            ),
-            _ => log::warn!(
-                "launchctl stop failed for configured service {}",
-                launchd_label
-            ),
+    command.spawn().ok()
+}
+
+async fn finish_stop_command(mut child: Child, command_timeout: Duration) -> StopCommandOutcome {
+    match timeout(command_timeout, child.wait()).await {
+        Ok(Ok(status)) if status.success() => StopCommandOutcome::Succeeded,
+        Ok(_) => StopCommandOutcome::Failed,
+        Err(_) => {
+            terminate_timed_out_child(&mut child).await;
+            StopCommandOutcome::TimedOut
         }
-    });
-    true
+    }
+}
+
+async fn terminate_timed_out_child(child: &mut Child) {
+    let _ = child.start_kill();
+    let _ = timeout(Duration::from_secs(1), child.wait()).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wake::Launcher;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct PendingLauncher;
+
+    impl Launcher for PendingLauncher {
+        fn start(&self, _target: Arc<WakeTarget>) {}
+    }
 
     fn lifecycle_at(
         now: Instant,
@@ -482,14 +765,12 @@ mod tests {
             .unwrap();
         lifecycle.note_request_arrival_at(start + Duration::from_secs(2));
         let stop_called = AtomicBool::new(false);
-        assert!(!lifecycle.finish_allowed_attempt_at(
-            &attempt,
-            start + Duration::from_secs(3),
-            || {
+        let outcome =
+            lifecycle.start_allowed_attempt_at(&attempt, start + Duration::from_secs(3), || {
                 stop_called.store(true, Ordering::SeqCst);
-                true
-            }
-        ));
+                Some(())
+            });
+        assert!(matches!(outcome, StopStart::Obsolete));
         assert!(!stop_called.load(Ordering::SeqCst));
     }
 
@@ -510,13 +791,18 @@ mod tests {
                     "SIGTERM".to_owned(),
                     "gui/501/net.test.lifecycle".to_owned(),
                 ],
+                timeout: Duration::from_secs(5),
             }
         );
-        assert!(lifecycle.finish_allowed_attempt_at(
+        let outcome =
+            lifecycle
+                .start_allowed_attempt_at(&attempt, start + Duration::from_secs(1), || Some(()));
+        assert!(matches!(outcome, StopStart::Started(())));
+        lifecycle.finish_stop_command_at(
             &attempt,
+            &StopCommandOutcome::Succeeded,
             start + Duration::from_secs(1),
-            || true
-        ));
+        );
         assert!(
             lifecycle
                 .begin_stop_attempt_at(start + Duration::from_secs(2))
@@ -541,6 +827,101 @@ mod tests {
                 arguments: vec!["literal argument".to_owned(), "$(not-a-shell)".to_owned()],
                 timeout: Duration::from_secs(5),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_request_gate_rejects_new_admission_and_waits_for_existing_guard() {
+        let gate = RequestGate::new();
+        let admission = gate.admit().expect("initial admission");
+        gate.close();
+        assert!(gate.admit().is_none());
+        assert!(
+            !gate
+                .wait_for_drain_until(Instant::now() + Duration::from_millis(10))
+                .await
+        );
+        drop(admission);
+        assert!(
+            gate.wait_for_drain_until(Instant::now() + Duration::from_millis(10))
+                .await
+        );
+    }
+
+    #[test]
+    fn shutdown_ignores_idle_timeout_but_waits_for_an_active_lease() {
+        let start = Instant::now();
+        let lifecycle = lifecycle_at(start, Duration::from_secs(3_600), None);
+        let lease = lifecycle.acquire_at(start);
+        assert_eq!(
+            lifecycle.prepare_shutdown(),
+            ShutdownPreparation::CleanupNeeded
+        );
+        assert!(matches!(
+            lifecycle.begin_shutdown_attempt(),
+            ShutdownAttempt::Busy
+        ));
+        drop(lease);
+        let ShutdownAttempt::Ready(attempt) = lifecycle.begin_shutdown_attempt() else {
+            panic!("shutdown did not become eligible after lease release");
+        };
+        assert!(!attempt.requires_idle_timeout);
+    }
+
+    #[test]
+    fn idle_and_shutdown_stop_attempts_wait_for_an_in_progress_wake() {
+        let start = Instant::now();
+        let wake_target = WakeTarget::with_launcher(
+            "127.0.0.1:19004".parse().unwrap(),
+            "net.test.lifecycle.waking".to_owned(),
+            501,
+            Arc::new(PendingLauncher),
+        );
+        let lifecycle = ServiceLifecycle::new_at(
+            "net.test.lifecycle.waking".to_owned(),
+            501,
+            Duration::from_secs(1),
+            None,
+            Arc::clone(&wake_target),
+            start,
+        );
+
+        wake_target.request_launch();
+        assert!(wake_target.launch_in_progress());
+        assert!(
+            lifecycle
+                .begin_stop_attempt_at(start + Duration::from_secs(60))
+                .is_none()
+        );
+        assert!(matches!(
+            lifecycle.begin_shutdown_attempt(),
+            ShutdownAttempt::Busy
+        ));
+    }
+
+    #[test]
+    fn failed_launchctl_result_reopens_the_generation_after_retry_backoff() {
+        let start = Instant::now();
+        let lifecycle = lifecycle_at(start, Duration::from_secs(1), None);
+        let attempt = lifecycle
+            .begin_stop_attempt_at(start + Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            lifecycle
+                .start_allowed_attempt_at(&attempt, start + Duration::from_secs(1), || Some(())),
+            StopStart::Started(())
+        ));
+        let failed = start + Duration::from_secs(2);
+        lifecycle.finish_stop_command_at(&attempt, &StopCommandOutcome::Failed, failed);
+        assert!(
+            lifecycle
+                .begin_stop_attempt_at(failed + STOP_CHECK_RETRY - Duration::from_nanos(1))
+                .is_none()
+        );
+        assert!(
+            lifecycle
+                .begin_stop_attempt_at(failed + STOP_CHECK_RETRY)
+                .is_some()
         );
     }
 

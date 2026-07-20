@@ -1,9 +1,10 @@
+use async_trait::async_trait;
 use clap::{Parser, Subcommand};
-use pingora::server::Server;
 use pingora::server::configuration::ServerConf;
+use pingora::server::{RunArgs, Server, ShutdownSignal, ShutdownSignalWatch};
 use pingora::services::background::background_service;
 use roused::config::Config;
-use roused::proxy::RousedProxy;
+use roused::proxy::{GatewayShutdownHandle, RousedProxy};
 use roused::setup::{SetupError, gateway_plist_xml};
 use std::env;
 use std::error::Error;
@@ -12,6 +13,41 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use tokio::signal::unix::{SignalKind, signal};
+
+const GATEWAY_GRACE_PERIOD_SECONDS: u64 = 20;
+const GATEWAY_RUNTIME_SHUTDOWN_TIMEOUT_SECONDS: u64 = 2;
+
+struct GatewayShutdownSignals {
+    shutdown: GatewayShutdownHandle,
+}
+
+#[async_trait]
+impl ShutdownSignalWatch for GatewayShutdownSignals {
+    async fn recv(&self) -> ShutdownSignal {
+        let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut interrupt = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+        let mut quit = signal(SignalKind::quit()).expect("install SIGQUIT handler");
+
+        tokio::select! {
+            _ = terminate.recv() => {
+                self.shutdown.begin_shutdown();
+                log::info!("gateway received SIGTERM; starting coordinated shutdown");
+                ShutdownSignal::GracefulTerminate
+            }
+            _ = interrupt.recv() => {
+                self.shutdown.begin_shutdown();
+                log::info!("gateway received SIGINT; starting coordinated shutdown");
+                ShutdownSignal::GracefulTerminate
+            }
+            _ = quit.recv() => {
+                self.shutdown.begin_shutdown();
+                log::info!("gateway received SIGQUIT; starting Pingora graceful-upgrade shutdown");
+                ShutdownSignal::GracefulUpgrade
+            },
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -220,6 +256,8 @@ fn run_gateway(config_path: PathBuf) -> Result<(), Box<dyn Error>> {
     let mut server_config = ServerConf {
         // Pingora treats this field as the total attempt cap, despite its name.
         max_retries: 1,
+        grace_period_seconds: Some(GATEWAY_GRACE_PERIOD_SECONDS),
+        graceful_shutdown_timeout_seconds: Some(GATEWAY_RUNTIME_SHUTDOWN_TIMEOUT_SECONDS),
         ..ServerConf::default()
     };
     // HTTP/1.1 only; no HTTP/2 listener behavior is enabled.
@@ -227,6 +265,7 @@ fn run_gateway(config_path: PathBuf) -> Result<(), Box<dyn Error>> {
 
     let listen = config.listen();
     let proxy = RousedProxy::new(&config);
+    let shutdown = proxy.shutdown_handle();
     let idle_monitor = background_service("idle shutdown", proxy.idle_monitor());
     let mut server = Server::new_with_opt_and_conf(None, server_config);
     server.bootstrap();
@@ -235,5 +274,8 @@ fn run_gateway(config_path: PathBuf) -> Result<(), Box<dyn Error>> {
     service.add_tcp(&listen.to_string());
     server.add_service(service);
     server.add_service(idle_monitor);
-    server.run_forever();
+    server.run(RunArgs {
+        shutdown_signal: Box::new(GatewayShutdownSignals { shutdown }),
+    });
+    Ok(())
 }

@@ -108,6 +108,7 @@ pub fn gateway_plist_xml(
         ),
         ("RunAtLoad", PropertyListValue::Bool(true)),
         ("KeepAlive", PropertyListValue::Bool(true)),
+        ("ExitTimeOut", PropertyListValue::Integer(30)),
         ("StandardOutPath", PropertyListValue::String(stdout_log)),
         ("StandardErrorPath", PropertyListValue::String(stderr_log)),
     ]);
@@ -158,6 +159,7 @@ enum PropertyListValue<'a> {
     Array(Vec<PropertyListValue<'a>>),
     String(&'a str),
     Bool(bool),
+    Integer(u64),
 }
 
 impl PropertyListValue<'_> {
@@ -194,6 +196,10 @@ impl PropertyListValue<'_> {
             Self::Bool(value) => {
                 write_indentation(output, indentation);
                 output.push_str(if *value { "<true/>\n" } else { "<false/>\n" });
+            }
+            Self::Integer(value) => {
+                write_indentation(output, indentation);
+                output.push_str(&format!("<integer>{value}</integer>\n"));
             }
         }
     }
@@ -250,6 +256,7 @@ mod tests {
         );
         assert!(first.contains("<key>RunAtLoad</key>\n  <true/>"));
         assert!(first.contains("<key>KeepAlive</key>\n  <true/>"));
+        assert!(first.contains("<key>ExitTimeOut</key>\n  <integer>30</integer>"));
         assert!(first.contains("<key>StandardOutPath</key>"));
         assert!(first.contains("<key>StandardErrorPath</key>"));
     }
