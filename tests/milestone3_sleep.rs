@@ -23,6 +23,7 @@ const GATEWAY_EXIT_TIMEOUT: Duration = Duration::from_secs(28);
 const PROMPT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 const SLOW_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(12);
 const FIVE_SECOND_LOWER_BOUND: Duration = Duration::from_millis(4_500);
+const STOP_CHECK_RETRY_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(36);
 const SHORT_IDLE_SECONDS: u64 = 1;
 const LONG_IDLE_SECONDS: u64 = 60;
 const WAKE_SAFE_IDLE_SECONDS: u64 = 6;
@@ -324,6 +325,72 @@ fn missing_stop_check_keeps_the_target_running() {
     assert_eq!(request_ok(proxy.address(), "/missing-checker").status, 200);
     wait_for_proxy_log(&proxy, "stop check failed");
     target.assert_running_without_sigterm("missing stop checker");
+}
+
+#[test]
+fn untouched_stop_failure_is_one_shot_while_stop_check_veto_retries() {
+    let mut one_shot_target = TargetLaunchAgentFixture::new();
+    one_shot_target.bootstrap();
+    assert!(
+        one_shot_target.job_pid().is_none(),
+        "RunAtLoad=false one-shot target started"
+    );
+    let mut checked_target = TargetLaunchAgentFixture::new();
+    checked_target.bootstrap();
+    assert!(
+        checked_target.job_pid().is_none(),
+        "RunAtLoad=false checked target started"
+    );
+
+    let check_log = checked_target.directory.path().join("untouched-check.log");
+    let allow = checked_target.directory.path().join("allow-untouched-stop");
+    let environment = checker_environment("state", &check_log, Some(&allow), None);
+    let checker = checker_command();
+    let one_shot_upstream = one_shot_target.address;
+    let one_shot_label = one_shot_target.label.clone();
+    let checked_upstream = checked_target.address;
+    let checked_label = checked_target.label.clone();
+    let proxy = ProxyProcess::spawn_with_stderr_capture_and_environment(
+        move |listen| {
+            let mut configuration = service_configuration(
+                listen,
+                "one-shot.apps.test",
+                one_shot_upstream,
+                &one_shot_label,
+                SHORT_IDLE_SECONDS,
+                None,
+            );
+            configuration.push_str(&service_entry(
+                "checked.apps.test",
+                checked_upstream,
+                &checked_label,
+                SHORT_IDLE_SECONDS,
+                Some(&checker),
+            ));
+            configuration
+        },
+        environment,
+    );
+
+    let stop_started = format!(
+        "launchctl stop started for configured service {}",
+        one_shot_target.label
+    );
+    let stop_failed = format!(
+        "launchctl stop failed for configured service {}",
+        one_shot_target.label
+    );
+    wait_for_proxy_log(&proxy, &stop_failed);
+    wait_for_file_lines(&check_log, 4, STOP_CHECK_RETRY_OBSERVATION_TIMEOUT);
+
+    let stderr = proxy.stderr_contents();
+    assert_eq!(stderr.matches(&stop_started).count(), 1, "{stderr}");
+    assert_eq!(stderr.matches(&stop_failed).count(), 1, "{stderr}");
+    assert!(one_shot_target.job_pid().is_none());
+    assert!(checked_target.job_pid().is_none());
+    assert!(file_lines(&one_shot_target.start_log).is_empty());
+    assert!(file_lines(&checked_target.start_log).is_empty());
+    assert!(checker_attempts(&check_log) >= 2);
 }
 
 #[test]

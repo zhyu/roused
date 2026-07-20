@@ -218,14 +218,23 @@ For proxied work, the idle interval begins when the most recent request
 completes. A configured request arrival also advances the grace period and
 invalidates an obsolete pending stop decision. Shutdown is considered only
 when no request is in flight. Each service receives a fresh idle grace period
-when the gateway starts; lifecycle state is not persisted.
+when the gateway starts; lifecycle state is not persisted. This startup grace
+applies to every configured label, including a service that this gateway
+instance has never awakened, so that a replacement gateway can adopt a target
+that survived its predecessor.
 
 When `can_stop_command` is configured, Roused executes it directly without a
 shell. Arguments are literal, and stdin, stdout, and stderr are discarded. Use
 absolute paths for executables and any file arguments, especially when Roused
 runs under launchd. Only exit status 0 permits shutdown. Failure, a nonzero
 status, or the fixed five-second timeout keeps the target running; while it
-remains idle, another check runs no sooner than 30 seconds later.
+remains idle during ordinary monitoring, another check runs no sooner than 30
+seconds later. This retry applies even when the gateway has never awakened the
+service, so the command must safely handle a target that is already stopped.
+If that state is safe, return status 0; otherwise Roused continues checking at
+the bounded cadence until activity resets the idle interval or a check permits
+the stop. Gateway-shutdown cleanup makes only its single bounded check instead
+of waiting for this retry cycle.
 
 After an allowed check and an atomic activity recheck, Roused starts and awaits
 this best-effort call, with a fixed five-second timeout:
@@ -234,6 +243,13 @@ this best-effort call, with a fixed five-second timeout:
 /bin/launchctl kill SIGTERM gui/$UID/<launchd_label>
 ```
 
+Once that launchctl command starts, Roused records one stop attempt for the
+current lifecycle generation, regardless of whether launchctl succeeds, fails,
+or times out. It does not repeat the command until a later request creates a
+new generation or a replacement gateway starts with fresh lifecycle state. If
+launchctl cannot be started at all, no stop attempt was accepted; ordinary
+monitoring retries the full decision, including `can_stop_command`, after the
+same minimum 30-second cooldown.
 This signals the job but does not unload it. If the target exits on `SIGTERM`
 and has `KeepAlive=false`, it remains stopped until a later request wakes it.
 Roused does not drain the target, escalate to `SIGKILL`, discover its PID, or

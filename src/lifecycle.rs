@@ -454,20 +454,9 @@ impl ServiceLifecycle {
         }
     }
 
-    fn finish_stop_command_at(
-        &self,
-        attempt: &StopAttempt,
-        outcome: &StopCommandOutcome,
-        now: Instant,
-    ) {
+    fn finish_started_stop_command(&self) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.attempt_in_progress = false;
-        if *outcome != StopCommandOutcome::Succeeded && state.generation == attempt.generation {
-            if state.stop_attempted_generation == Some(attempt.generation) {
-                state.stop_attempted_generation = None;
-            }
-            state.last_check_finished = Some(now);
-        }
     }
 
     fn stop_check_spec(command: Vec<String>, check_timeout: Duration) -> StopCheckSpec {
@@ -513,7 +502,7 @@ impl ServiceLifecycle {
                             self.launchd_label
                         );
                         let outcome = finish_stop_command(child, spec.timeout).await;
-                        self.finish_stop_command_at(&attempt, &outcome, Instant::now());
+                        self.finish_started_stop_command();
                         match outcome {
                             StopCommandOutcome::Succeeded => log::info!(
                                 "launchctl stop completed for configured service {}",
@@ -879,11 +868,7 @@ mod tests {
             lifecycle
                 .start_allowed_attempt_at(&attempt, start + Duration::from_secs(1), || Some(()));
         assert!(matches!(outcome, StopStart::Started(())));
-        lifecycle.finish_stop_command_at(
-            &attempt,
-            &StopCommandOutcome::Succeeded,
-            start + Duration::from_secs(1),
-        );
+        lifecycle.finish_started_stop_command();
         assert!(
             lifecycle
                 .begin_stop_attempt_at(start + Duration::from_secs(2))
@@ -1012,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_launchctl_result_reopens_the_generation_after_retry_backoff() {
+    fn started_launchctl_command_closes_generation_until_new_activity() {
         let start = Instant::now();
         let lifecycle = lifecycle_at(start, Duration::from_secs(1), None);
         let attempt = lifecycle
@@ -1023,16 +1008,18 @@ mod tests {
                 .start_allowed_attempt_at(&attempt, start + Duration::from_secs(1), || Some(())),
             StopStart::Started(())
         ));
-        let failed = start + Duration::from_secs(2);
-        lifecycle.finish_stop_command_at(&attempt, &StopCommandOutcome::Failed, failed);
+        lifecycle.finish_started_stop_command();
         assert!(
             lifecycle
-                .begin_stop_attempt_at(failed + STOP_CHECK_RETRY - Duration::from_nanos(1))
+                .begin_stop_attempt_at(start + Duration::from_secs(3_600))
                 .is_none()
         );
+
+        let activity = start + Duration::from_secs(3_601);
+        lifecycle.note_request_arrival_at(activity);
         assert!(
             lifecycle
-                .begin_stop_attempt_at(failed + STOP_CHECK_RETRY)
+                .begin_stop_attempt_at(activity + Duration::from_secs(1))
                 .is_some()
         );
     }

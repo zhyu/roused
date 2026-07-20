@@ -189,9 +189,23 @@ attempt already in progress, and atomically rechecks request generation,
 in-flight count, and launch state before spawning `launchctl`. The checker and
 the `launchctl kill SIGTERM` call each have a five-second timeout. Roused owns
 and awaits those child tasks and all stop tasks already in progress before its
-background lifecycle service exits. Stop-command failure clears the accepted
-generation and applies the ordinary 30-second retry backoff while the gateway
-continues running.
+background lifecycle service exits.
+
+During ordinary idle monitoring, a vetoed, failed, or timed-out
+`can_stop_command` leaves the unchanged idle generation eligible for another
+check after the 30-second retry cooldown. This includes the initial lifecycle
+generation for every configured label, even when the gateway has not awakened
+that service; a checker must therefore safely handle an already-stopped target
+and return success when stopping that state is safe. Once a permitted
+`launchctl kill SIGTERM` command starts, its generation remains recorded as
+having received one best-effort stop attempt regardless of whether launchctl
+succeeds, fails, or times out. Roused does not repeat launchctl for that
+generation. Failure to start launchctl itself accepts no stop attempt, so
+ordinary monitoring retries the full decision, including the checker, after
+the same cooldown. Configured-host activity creates a new generation, and a
+gateway restart creates fresh in-memory lifecycle state. Shutdown cleanup
+performs its single bounded checker decision without waiting for the ordinary
+retry cycle.
 
 The shutdown is best effort: an undrained request or wake, a vetoed, failed, or
 timed-out check, invalidating activity, and launchctl failure all leave the
