@@ -1,6 +1,6 @@
 use crate::config::{Config, normalize_request_host};
 use crate::lifecycle::{
-    IdleMonitor, RequestAdmission, RequestGate, ServiceLease, ServiceLifecycle,
+    IdleMonitor, RequestAdmission, RequestGate, ServiceLease, ServiceLifecycle, ShutdownCoordinator,
 };
 use crate::wake::{WakeTarget, current_user_id};
 use async_trait::async_trait;
@@ -27,16 +27,21 @@ pub struct RousedProxy {
     routes: HashMap<String, Arc<ServiceRoute>>,
     idle_monitor: IdleMonitor,
     request_gate: Arc<RequestGate>,
+    shutdown: Arc<ShutdownCoordinator>,
 }
 
 #[derive(Clone)]
 pub struct GatewayShutdownHandle {
-    request_gate: Arc<RequestGate>,
+    shutdown: Arc<ShutdownCoordinator>,
 }
 
 impl GatewayShutdownHandle {
     pub fn begin_shutdown(&self) {
-        self.request_gate.close();
+        self.shutdown.request();
+    }
+
+    pub async fn wait_for_cleanup(&self, max_wait: Duration) -> bool {
+        self.shutdown.wait_for_completion(max_wait).await
     }
 }
 
@@ -57,6 +62,7 @@ impl RousedProxy {
     pub fn new(config: &Config) -> Self {
         let user_id = current_user_id();
         let request_gate = RequestGate::new();
+        let shutdown = ShutdownCoordinator::new(Arc::clone(&request_gate));
         let mut lifecycles = Vec::new();
         let routes = config
             .services()
@@ -83,8 +89,13 @@ impl RousedProxy {
         Self {
             listener_port: config.listen().port(),
             routes,
-            idle_monitor: IdleMonitor::new(lifecycles, Arc::clone(&request_gate)),
+            idle_monitor: IdleMonitor::new(
+                lifecycles,
+                Arc::clone(&request_gate),
+                Arc::clone(&shutdown),
+            ),
             request_gate,
+            shutdown,
         }
     }
 
@@ -96,7 +107,7 @@ impl RousedProxy {
 
     pub fn shutdown_handle(&self) -> GatewayShutdownHandle {
         GatewayShutdownHandle {
-            request_gate: Arc::clone(&self.request_gate),
+            shutdown: Arc::clone(&self.shutdown),
         }
     }
 }

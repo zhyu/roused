@@ -6,7 +6,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 
@@ -21,6 +21,18 @@ pub(crate) const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct RequestGate {
     state: Mutex<RequestGateState>,
     changed: Notify,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShutdownPhase {
+    Running,
+    Requested,
+    Completed,
+}
+
+pub(crate) struct ShutdownCoordinator {
+    request_gate: Arc<RequestGate>,
+    phase: watch::Sender<ShutdownPhase>,
 }
 
 #[derive(Debug)]
@@ -63,6 +75,7 @@ pub(crate) struct ServiceLease {
 pub(crate) struct IdleMonitor {
     services: Vec<Arc<ServiceLifecycle>>,
     request_gate: Arc<RequestGate>,
+    shutdown: Arc<ShutdownCoordinator>,
 }
 
 #[derive(Debug)]
@@ -189,6 +202,63 @@ impl RequestGate {
         if drained {
             self.changed.notify_one();
         }
+    }
+}
+
+impl ShutdownCoordinator {
+    pub(crate) fn new(request_gate: Arc<RequestGate>) -> Arc<Self> {
+        let (phase, _) = watch::channel(ShutdownPhase::Running);
+        Arc::new(Self {
+            request_gate,
+            phase,
+        })
+    }
+
+    pub(crate) fn request(&self) {
+        self.request_gate.close();
+        self.phase.send_if_modified(|phase| {
+            if *phase == ShutdownPhase::Running {
+                *phase = ShutdownPhase::Requested;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    async fn wait_for_request(&self) {
+        let mut phase = self.phase.subscribe();
+        if *phase.borrow_and_update() != ShutdownPhase::Running {
+            return;
+        }
+        let _ = phase
+            .wait_for(|phase| *phase != ShutdownPhase::Running)
+            .await;
+    }
+
+    pub(crate) fn complete(&self) {
+        self.phase.send_if_modified(|phase| {
+            if *phase != ShutdownPhase::Completed {
+                *phase = ShutdownPhase::Completed;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    pub(crate) async fn wait_for_completion(&self, max_wait: Duration) -> bool {
+        timeout(max_wait, async {
+            let mut phase = self.phase.subscribe();
+            if *phase.borrow_and_update() == ShutdownPhase::Completed {
+                return;
+            }
+            let _ = phase
+                .wait_for(|phase| *phase == ShutdownPhase::Completed)
+                .await;
+        })
+        .await
+        .is_ok()
     }
 }
 
@@ -513,10 +583,12 @@ impl IdleMonitor {
     pub(crate) fn new(
         services: Vec<Arc<ServiceLifecycle>>,
         request_gate: Arc<RequestGate>,
+        shutdown: Arc<ShutdownCoordinator>,
     ) -> Self {
         Self {
             services,
             request_gate,
+            shutdown,
         }
     }
 
@@ -574,10 +646,19 @@ impl BackgroundService for IdleMonitor {
         let mut scan = interval(IDLE_SCAN_INTERVAL);
         scan.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut attempts = JoinSet::new();
+        let requested = self.shutdown.wait_for_request();
+        tokio::pin!(requested);
         loop {
             tokio::select! {
-                _ = shutdown.changed() => {
+                _ = &mut requested => {
                     self.cleanup_at_shutdown(&mut attempts).await;
+                    self.shutdown.complete();
+                    break;
+                },
+                _ = shutdown.changed() => {
+                    self.shutdown.request();
+                    self.cleanup_at_shutdown(&mut attempts).await;
+                    self.shutdown.complete();
                     break;
                 },
                 _ = scan.tick() => self.scan_at(Instant::now(), &mut attempts),
@@ -848,6 +929,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn shutdown_request_is_sticky_and_closes_admission_before_observation() {
+        let gate = RequestGate::new();
+        let coordinator = ShutdownCoordinator::new(Arc::clone(&gate));
+
+        coordinator.request();
+
+        assert!(gate.admit().is_none());
+        timeout(Duration::from_millis(50), coordinator.wait_for_request())
+            .await
+            .expect("preexisting shutdown request was not observed");
+    }
+
+    #[tokio::test]
+    async fn shutdown_completion_is_sticky_idempotent_and_never_regresses() {
+        let gate = RequestGate::new();
+        let coordinator = ShutdownCoordinator::new(gate);
+
+        coordinator.request();
+        coordinator.complete();
+        coordinator.complete();
+        coordinator.request();
+
+        assert_eq!(*coordinator.phase.borrow(), ShutdownPhase::Completed);
+        assert!(
+            coordinator
+                .wait_for_completion(Duration::from_millis(50))
+                .await
+        );
+    }
+
     #[test]
     fn shutdown_ignores_idle_timeout_but_waits_for_an_active_lease() {
         let start = Instant::now();
@@ -958,5 +1070,22 @@ mod tests {
         })
         .await;
         assert_eq!(timed_out, StopCheckOutcome::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn stop_command_timeout_terminates_the_child_promptly() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("10").kill_on_drop(true);
+        let child = command.spawn().expect("spawn sleeping stop command");
+        let started = Instant::now();
+
+        let outcome = finish_stop_command(child, Duration::from_millis(20)).await;
+
+        assert_eq!(outcome, StopCommandOutcome::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timed-out stop command cleanup took {:?}",
+            started.elapsed()
+        );
     }
 }

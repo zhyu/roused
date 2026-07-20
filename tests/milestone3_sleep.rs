@@ -20,6 +20,9 @@ use support::{
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(12);
 const GATEWAY_EXIT_TIMEOUT: Duration = Duration::from_secs(28);
+const PROMPT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
+const SLOW_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(12);
+const FIVE_SECOND_LOWER_BOUND: Duration = Duration::from_millis(4_500);
 const SHORT_IDLE_SECONDS: u64 = 1;
 const LONG_IDLE_SECONDS: u64 = 60;
 const WAKE_SAFE_IDLE_SECONDS: u64 = 6;
@@ -353,9 +356,13 @@ fn foreground_sigterm_drains_a_request_then_cleans_up_before_exit() {
         .expect("read held-response prefix");
     assert_eq!(prefix, vec![b'R'; STREAM_SEGMENT_BYTES]);
 
+    let shutdown_started = Instant::now();
     proxy.send_signal(libc::SIGTERM);
     thread::sleep(Duration::from_millis(300));
     target.assert_running_without_sigterm("gateway request drain");
+    let rejected = request_ok(proxy.address(), "/during-gateway-shutdown");
+    assert_eq!(rejected.status, 503);
+    assert_eq!(rejected.body, b"gateway shutting down\n");
     fs::write(&target.response_gate, b"release\n").expect("release held response");
     let suffix = read_exact_with_prefix(&mut client, Vec::new(), STREAM_SEGMENT_BYTES)
         .expect("read held-response suffix");
@@ -367,6 +374,11 @@ fn foreground_sigterm_drains_a_request_then_cleans_up_before_exit() {
     target.wait_until_stopped();
     let status = proxy.wait_for_exit(GATEWAY_EXIT_TIMEOUT);
     assert!(status.success(), "SIGTERM gateway exit was {status}");
+    assert!(
+        shutdown_started.elapsed() < PROMPT_SHUTDOWN_TIMEOUT,
+        "prompt SIGTERM shutdown took {:?}",
+        shutdown_started.elapsed()
+    );
     let stderr = proxy.stderr_contents();
     assert!(stderr.contains("gateway received SIGTERM"), "{stderr}");
     assert!(stderr.contains("launchctl stop completed"), "{stderr}");
@@ -374,10 +386,17 @@ fn foreground_sigterm_drains_a_request_then_cleans_up_before_exit() {
         stderr.contains("gateway shutdown cleanup completed"),
         "{stderr}"
     );
+    let cleanup_completed = stderr
+        .find("gateway shutdown cleanup completed")
+        .expect("cleanup completion log");
+    let pingora_shutdown = stderr
+        .find("SIGTERM received, gracefully exiting")
+        .expect("Pingora SIGTERM log");
+    assert!(cleanup_completed < pingora_shutdown, "{stderr}");
 }
 
 #[test]
-fn foreground_sigint_runs_the_shutdown_checker_and_cleans_up_before_exit() {
+fn foreground_sigint_cleans_services_concurrently_and_exits_after_checker_release() {
     let mut target = TargetLaunchAgentFixture::new();
     target.bootstrap();
     target.kickstart();
@@ -388,9 +407,8 @@ fn foreground_sigint_runs_the_shutdown_checker_and_cleans_up_before_exit() {
     second_target.wait_until_running(1);
 
     let check_log = target.directory.path().join("shutdown-allow-check.log");
-    let allow = target.directory.path().join("allow-shutdown");
-    fs::write(&allow, b"allow\n").expect("allow shutdown checker");
-    let environment = checker_environment("state", &check_log, Some(&allow), None);
+    let release = target.directory.path().join("release-shutdown-check");
+    let environment = checker_environment("blocked", &check_log, None, Some(&release));
     let checker = checker_command();
     let upstream = target.address;
     let label = target.label.clone();
@@ -419,11 +437,15 @@ fn foreground_sigint_runs_the_shutdown_checker_and_cleans_up_before_exit() {
     );
 
     assert_eq!(request_ok(proxy.address(), "/before-sigint").status, 200);
+    let shutdown_started = Instant::now();
     proxy.send_signal(libc::SIGINT);
     wait_for_checker_attempts(&check_log, 1);
+    wait_for_file_lines(&second_target.signal_log, 1, WAIT_TIMEOUT);
+    second_target.wait_until_stopped();
+    target.assert_running_without_sigterm("blocked shutdown checker");
+    fs::write(&release, b"release\n").expect("release shutdown checker");
     wait_for_log_value(&check_log, "allowed");
     wait_for_file_lines(&target.signal_log, 1, WAIT_TIMEOUT);
-    wait_for_file_lines(&second_target.signal_log, 1, WAIT_TIMEOUT);
     assert_eq!(checker_attempts(&check_log), 1);
     assert_eq!(file_lines(&target.signal_log), ["SIGTERM"]);
     assert_eq!(file_lines(&second_target.signal_log), ["SIGTERM"]);
@@ -431,12 +453,64 @@ fn foreground_sigint_runs_the_shutdown_checker_and_cleans_up_before_exit() {
     second_target.wait_until_stopped();
     let status = proxy.wait_for_exit(GATEWAY_EXIT_TIMEOUT);
     assert!(status.success(), "SIGINT gateway exit was {status}");
+    assert!(
+        shutdown_started.elapsed() < PROMPT_SHUTDOWN_TIMEOUT,
+        "released SIGINT shutdown took {:?}",
+        shutdown_started.elapsed()
+    );
     let stderr = proxy.stderr_contents();
     assert!(stderr.contains("gateway received SIGINT"), "{stderr}");
     assert!(
         stderr.contains("gateway shutdown cleanup completed"),
         "{stderr}"
     );
+}
+
+#[test]
+fn foreground_sigquit_finishes_cleanup_before_pingora_upgrade_shutdown() {
+    let mut target = TargetLaunchAgentFixture::new();
+    target.bootstrap();
+    target.kickstart();
+    target.wait_until_running(1);
+
+    let upstream = target.address;
+    let label = target.label.clone();
+    let mut proxy = ProxyProcess::spawn_with_stderr_capture(move |listen| {
+        service_configuration(
+            listen,
+            "sleep.apps.test",
+            upstream,
+            &label,
+            LONG_IDLE_SECONDS,
+            None,
+        )
+    });
+
+    let shutdown_started = Instant::now();
+    proxy.send_signal(libc::SIGQUIT);
+    wait_for_file_lines(&target.signal_log, 1, WAIT_TIMEOUT);
+    assert_eq!(file_lines(&target.signal_log), ["SIGTERM"]);
+    target.wait_until_stopped();
+    let status = proxy.wait_for_exit(GATEWAY_EXIT_TIMEOUT);
+    assert!(status.success(), "SIGQUIT gateway exit was {status}");
+    assert!(
+        shutdown_started.elapsed() >= FIVE_SECOND_LOWER_BOUND,
+        "SIGQUIT skipped Pingora's upgrade delay after {:?}",
+        shutdown_started.elapsed()
+    );
+    assert!(
+        shutdown_started.elapsed() < SLOW_SHUTDOWN_TIMEOUT,
+        "SIGQUIT shutdown took {:?}",
+        shutdown_started.elapsed()
+    );
+    let stderr = proxy.stderr_contents();
+    let cleanup_completed = stderr
+        .find("gateway shutdown cleanup completed")
+        .unwrap_or_else(|| panic!("missing cleanup completion log: {stderr}"));
+    let pingora_upgrade = stderr
+        .find("SIGQUIT received, sending socks and gracefully exiting")
+        .unwrap_or_else(|| panic!("missing Pingora SIGQUIT log: {stderr}"));
+    assert!(cleanup_completed < pingora_upgrade, "{stderr}");
 }
 
 #[test]
@@ -466,6 +540,7 @@ fn shutdown_checker_veto_leaves_the_target_running() {
         environment,
     );
 
+    let shutdown_started = Instant::now();
     proxy.send_signal(libc::SIGTERM);
     wait_for_checker_attempts(&check_log, 1);
     wait_for_log_value(&check_log, "veto");
@@ -473,6 +548,11 @@ fn shutdown_checker_veto_leaves_the_target_running() {
     assert!(status.success(), "vetoed gateway exit was {status}");
     assert_eq!(checker_attempts(&check_log), 1);
     target.assert_running_without_sigterm("shutdown checker veto");
+    assert!(
+        shutdown_started.elapsed() < PROMPT_SHUTDOWN_TIMEOUT,
+        "vetoed SIGTERM shutdown took {:?}",
+        shutdown_started.elapsed()
+    );
     let stderr = proxy.stderr_contents();
     assert!(stderr.contains("stop check vetoed shutdown"), "{stderr}");
     assert!(
@@ -507,6 +587,7 @@ fn shutdown_checker_timeout_is_bounded_and_leaves_the_target_running() {
         environment,
     );
 
+    let shutdown_started = Instant::now();
     proxy.send_signal(libc::SIGTERM);
     wait_for_checker_attempts(&check_log, 1);
     wait_for_proxy_log(&proxy, "stop check timed out");
@@ -517,6 +598,15 @@ fn shutdown_checker_timeout_is_bounded_and_leaves_the_target_running() {
     );
     assert_eq!(checker_attempts(&check_log), 1);
     target.assert_running_without_sigterm("shutdown checker timeout");
+    let elapsed = shutdown_started.elapsed();
+    assert!(
+        elapsed >= FIVE_SECOND_LOWER_BOUND,
+        "checker timeout shutdown returned too early after {elapsed:?}"
+    );
+    assert!(
+        elapsed < SLOW_SHUTDOWN_TIMEOUT,
+        "checker timeout shutdown took {elapsed:?}"
+    );
 }
 
 #[test]
@@ -534,6 +624,7 @@ fn launchctl_failure_is_observed_before_gateway_shutdown_completes() {
         )
     });
 
+    let shutdown_started = Instant::now();
     proxy.send_signal(libc::SIGTERM);
     let status = proxy.wait_for_exit(GATEWAY_EXIT_TIMEOUT);
     assert!(
@@ -548,6 +639,15 @@ fn launchctl_failure_is_observed_before_gateway_shutdown_completes() {
         .find("gateway shutdown cleanup completed")
         .unwrap_or_else(|| panic!("missing cleanup completion log: {stderr}"));
     assert!(failed < cleanup_completed, "{stderr}");
+    assert!(
+        shutdown_started.elapsed() < PROMPT_SHUTDOWN_TIMEOUT,
+        "missing-label SIGTERM shutdown took {:?}",
+        shutdown_started.elapsed()
+    );
+    let pingora_shutdown = stderr
+        .find("SIGTERM received, gracefully exiting")
+        .unwrap_or_else(|| panic!("missing Pingora shutdown log: {stderr}"));
+    assert!(cleanup_completed < pingora_shutdown, "{stderr}");
 }
 
 #[test]
@@ -593,21 +693,31 @@ fn request_exceeding_shutdown_drain_timeout_leaves_the_target_running() {
         .expect("read held-response prefix");
     assert_eq!(prefix, vec![b'R'; STREAM_SEGMENT_BYTES]);
 
+    let shutdown_started = Instant::now();
     proxy.send_signal(libc::SIGTERM);
     wait_for_file_lines(&quiescent_target.signal_log, 1, WAIT_TIMEOUT);
     assert_eq!(file_lines(&quiescent_target.signal_log), ["SIGTERM"]);
     quiescent_target.wait_until_stopped();
     wait_for_proxy_log(&proxy, "did not drain in time");
     target.assert_running_without_sigterm("expired gateway request drain");
-    fs::write(&target.response_gate, b"release\n").expect("release held response");
-    let suffix = read_exact_with_prefix(&mut client, Vec::new(), STREAM_SEGMENT_BYTES)
-        .expect("read held-response suffix");
-    assert_eq!(suffix, vec![b'r'; STREAM_SEGMENT_BYTES]);
-    drop(client);
-
     let status = proxy.wait_for_exit(GATEWAY_EXIT_TIMEOUT);
     assert!(status.success(), "drain-timeout gateway exit was {status}");
+    assert!(
+        read_exact_with_prefix(&mut client, Vec::new(), STREAM_SEGMENT_BYTES).is_err(),
+        "request that exceeded the drain deadline unexpectedly survived gateway teardown"
+    );
+    drop(client);
+    fs::write(&target.response_gate, b"release\n").expect("release held response");
     target.assert_running_without_sigterm("gateway exit after drain timeout");
+    let elapsed = shutdown_started.elapsed();
+    assert!(
+        elapsed >= FIVE_SECOND_LOWER_BOUND,
+        "drain-timeout shutdown returned too early after {elapsed:?}"
+    );
+    assert!(
+        elapsed < SLOW_SHUTDOWN_TIMEOUT,
+        "drain-timeout shutdown took {elapsed:?}"
+    );
 }
 
 #[test]
@@ -876,10 +986,9 @@ fn target_launch_agent_child_entry() {
                 stream.flush().expect("flush held response prefix");
                 append_line(&request_log, "response-prefix");
                 wait_for_path(&response_gate, Duration::from_secs(30));
-                stream
+                let _ = stream
                     .write_all(&vec![b'r'; STREAM_SEGMENT_BYTES])
-                    .expect("write held response suffix");
-                stream.flush().expect("flush held response suffix");
+                    .and_then(|()| stream.flush());
             }
             "/disconnect-response" => {
                 let total = STREAM_SEGMENT_BYTES + 32 * 1024 * 1024;

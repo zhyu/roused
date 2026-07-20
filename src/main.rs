@@ -13,13 +13,34 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal};
 
-const GATEWAY_GRACE_PERIOD_SECONDS: u64 = 20;
-const GATEWAY_RUNTIME_SHUTDOWN_TIMEOUT_SECONDS: u64 = 2;
+const GATEWAY_CLEANUP_WAIT_TIMEOUT_SECONDS: u64 = 20;
+const GATEWAY_GRACE_PERIOD_SECONDS: u64 = 1;
+const GATEWAY_RUNTIME_SHUTDOWN_TIMEOUT_SECONDS: u64 = 0;
 
 struct GatewayShutdownSignals {
     shutdown: GatewayShutdownHandle,
+}
+
+impl GatewayShutdownSignals {
+    async fn coordinate_cleanup(&self, signal: &str) {
+        self.shutdown.begin_shutdown();
+        log::info!("gateway received {signal}; starting coordinated shutdown");
+        if self
+            .shutdown
+            .wait_for_cleanup(Duration::from_secs(GATEWAY_CLEANUP_WAIT_TIMEOUT_SECONDS))
+            .await
+        {
+            log::info!("gateway shutdown cleanup finished; handing shutdown to Pingora");
+        } else {
+            log::warn!(
+                "gateway shutdown cleanup exceeded the {}-second coordination limit; handing shutdown to Pingora",
+                GATEWAY_CLEANUP_WAIT_TIMEOUT_SECONDS
+            );
+        }
+    }
 }
 
 #[async_trait]
@@ -31,18 +52,16 @@ impl ShutdownSignalWatch for GatewayShutdownSignals {
 
         tokio::select! {
             _ = terminate.recv() => {
-                self.shutdown.begin_shutdown();
-                log::info!("gateway received SIGTERM; starting coordinated shutdown");
+                self.coordinate_cleanup("SIGTERM").await;
                 ShutdownSignal::GracefulTerminate
             }
             _ = interrupt.recv() => {
-                self.shutdown.begin_shutdown();
-                log::info!("gateway received SIGINT; starting coordinated shutdown");
+                self.coordinate_cleanup("SIGINT").await;
                 ShutdownSignal::GracefulTerminate
             }
             _ = quit.recv() => {
-                self.shutdown.begin_shutdown();
-                log::info!("gateway received SIGQUIT; starting Pingora graceful-upgrade shutdown");
+                self.coordinate_cleanup("SIGQUIT").await;
+                log::info!("starting Pingora graceful-upgrade shutdown");
                 ShutdownSignal::GracefulUpgrade
             },
         }

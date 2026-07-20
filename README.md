@@ -266,14 +266,26 @@ or times out, an existing stop decision is invalidated by activity, or
 cleanup candidate set is every configured label, including a target that was
 already running before this gateway process started.
 
-The gateway uses a 20-second graceful period and configures a two-second final
-runtime shutdown timeout; generated plists allow 30 seconds for the complete
-process exit. `SIGKILL`, a crash, or an unhandled terminating signal cannot run
-cleanup. If launchd restarts Roused after such an exit, the replacement
-does not scan processes or recover an old deadline; it creates fresh in-memory
-lifecycle state for every configured label. A surviving target is therefore
-managed under a fresh idle grace period, and later requests reset that new
-deadline normally.
+Roused waits for lifecycle cleanup to finish before handing `SIGTERM` or
+`SIGINT` to Pingora, subject to a 20-second coordination ceiling. Pingora then
+uses a one-second graceful period and a zero-second final runtime timeout. An
+empty or prompt cleanup therefore normally exits after the actual cleanup time
+plus about one second; a five-second request-drain or checker timeout normally
+exits after about six seconds. For `SIGTERM` or `SIGINT`, the longest legitimate
+sequential path for one service can approach 17 seconds including Pingora
+teardown, while services are still handled concurrently. If cleanup has not
+completed after 20 seconds, Roused proceeds with Pingora shutdown and the
+unfinished best-effort cleanup may be interrupted. A request that remains
+active past the five-second drain deadline may likewise be cut off during
+Pingora's following one-second grace. Generated plists allow 30 seconds as a
+launchd safety ceiling; that ceiling does not delay an earlier process exit.
+
+`SIGKILL`, a crash, or an unhandled terminating signal cannot run cleanup. If
+launchd restarts Roused after such an exit, the replacement does not scan
+processes or recover an old deadline; it creates fresh in-memory lifecycle
+state for every configured label. A surviving target is therefore managed
+under a fresh idle grace period, and later requests reset that new deadline
+normally.
 
 A service restart is indistinguishable from a permanent stop to the old
 gateway. In particular, `brew services restart roused` is a stop followed by a
@@ -281,9 +293,11 @@ start, not a configuration reload signal. The old gateway cleans up quiescent
 targets; the replacement does not eagerly start them again. A target left
 running by conservative cleanup is adopted under the replacement gateway's
 fresh lifecycle state. Roused still does not reload configuration in place.
-`SIGQUIT` retains Pingora's graceful-upgrade signal path and also closes request
-admission and runs cleanup when Pingora broadcasts shutdown; it is not a
-Roused configuration-reload interface.
+`SIGQUIT` closes request admission and waits for the same cleanup before
+entering Pingora's graceful-upgrade signal path. Pingora adds a fixed
+five-second upgrade delay before its one-second graceful period, so a prompt
+`SIGQUIT` takes about six seconds after cleanup. It is not a Roused
+configuration-reload interface.
 
 ## Run Roused at login
 
@@ -317,7 +331,8 @@ current executable. The command validates the configuration, safely escapes
 the generated XML, and refuses to overwrite an existing output.
 
 The generated plist sets `ExitTimeOut=30`, giving the coordinated shutdown a
-deterministic launchd window before forced termination. It sends stdout to
+launchd safety window before forced termination; it is not a fixed wait when
+Roused exits sooner. It sends stdout to
 `<label>.stdout.log` and stderr to `<label>.stderr.log` inside the selected
 directory. Deriving the names from the launchd label keeps separately labeled
 gateway instances from sharing log files. Roused's INFO/WARN lifecycle logs—including wake attempts and results,
