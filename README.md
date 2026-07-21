@@ -9,6 +9,12 @@ The bounded MVP is implemented and usable. It is intentionally designed for a
 trusted private network on one macOS host; it does not provide TLS or gateway
 authentication.
 
+When a client mistakenly starts a TLS handshake on the plain HTTP listener,
+Roused closes that connection without an HTTP response before request parsing.
+The connection cannot route, wake a target, or reach an upstream. This keeps
+automatic browser HTTPS attempts from producing misleading proxy failures or
+logging the raw ClientHello; it does not provide HTTPS.
+
 ## How it works
 
 1. A client sends a request to a configured hostname on the Roused listener.
@@ -179,6 +185,11 @@ wrong address becomes visible when wake attempts fail and clients continue
 receiving `503` responses.
 
 ## Request and wake behavior
+
+Only plain HTTP/1.1 reaches request routing. A connection whose initial bytes
+identify a TLS ClientHello is closed without an HTTP response or TLS alert,
+before Roused parses a request or selects a service. The client may then fall
+back to HTTP according to its own policy.
 
 Roused routes the HTTP `Host` header. A malformed or unconfigured host receives:
 
@@ -389,6 +400,7 @@ gateway operations needs `sudo` or writes under `/Library`.
 | --- | --- |
 | Repeated `503` responses | Confirm the target job is bootstrapped in `gui/$UID`, its label matches the configuration, and it listens on the configured loopback socket after kickstart. |
 | `421 Misdirected Request` | Confirm the request `Host` matches `services[].host`; an included port must equal the Roused listener port. |
+| An HTTPS URL closes without a response | This is the expected rejection on the plain HTTP listener. Use an explicit `http://` URL; Roused does not terminate TLS. |
 | A configuration edit has no effect | Restart Roused; configuration is loaded only at startup. A restart performs the normal bounded target cleanup first. |
 | A target never stops | Check for active requests or WebSockets, a vetoed/failed stop command, a target that ignores `SIGTERM`, or an incompatible launchd `KeepAlive` policy. |
 | The gateway does not start under launchd | Inspect `$HOME/Library/Logs/<label>.stderr.log` (or the selected override) and confirm that the log directory existed and was writable before bootstrapping the plist. |
@@ -399,7 +411,8 @@ headers, response headers, credentials, or checker argv.
 ## Current limitations
 
 - macOS and current-user `gui/$UID` LaunchAgents only;
-- plain HTTP/1.1 only—no TLS, HTTP/2, HTTP/3, or public-access hardening;
+- plain HTTP/1.1 only—TLS ClientHello connections are closed without a response,
+  and there is no TLS termination, HTTP/2, HTTP/3, or public-access hardening;
 - no gateway authentication, rate limits, body-size policy, or CORS policy;
 - no configuration reload, persistent lifecycle state, host aliases,
   dashboard, admin API, or metrics;

@@ -1,8 +1,12 @@
+mod plain_http;
+
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use pingora::server::configuration::ServerConf;
 use pingora::server::{RunArgs, Server, ShutdownSignal, ShutdownSignalWatch};
 use pingora::services::background::background_service;
+use pingora::services::listening::Service;
+use plain_http::PlainHttpApp;
 use roused::config::Config;
 use roused::proxy::{GatewayShutdownHandle, RousedProxy};
 use roused::setup::{SetupError, gateway_plist_xml};
@@ -289,7 +293,11 @@ fn run_gateway(config_path: PathBuf) -> Result<(), Box<dyn Error>> {
     let mut server = Server::new_with_opt_and_conf(None, server_config);
     server.bootstrap();
 
-    let mut service = pingora::proxy::http_proxy_service(&server.configuration, proxy);
+    let proxy = pingora::proxy::http_proxy(&server.configuration, proxy);
+    let mut service = Service::new(
+        "Pingora HTTP Proxy Service".to_owned(),
+        PlainHttpApp::new(proxy),
+    );
     service.add_tcp(&listen.to_string());
     server.add_service(service);
     server.add_service(idle_monitor);

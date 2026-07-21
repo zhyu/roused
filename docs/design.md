@@ -36,6 +36,10 @@ remains open; SSE is therefore not supported or investigated by this MVP.
 
 The gateway exposes configurable, unprivileged plain HTTP/1.1. There is no
 port 80 requirement, TLS provider, certificate handling, HTTP/2, or HTTP/3.
+Before HTTP parsing, a raw TCP connection whose initial bytes identify a TLS
+ClientHello is closed without an HTTP response or TLS alert. It must not enter
+routing, wake a target, contact an upstream, or log the ClientHello. This is a
+wrong-protocol rejection, not TLS support.
 
 ## Configuration contract
 
@@ -118,6 +122,10 @@ Launchd creates missing log files when it starts the job, so the selected
 directory must be writable before bootstrapping.
 
 ## Routing and proxy semantics
+
+Only a successfully parsed plain HTTP/1.1 request enters proxy semantics. TLS
+ClientHello rejection happens at the connection boundary before a proxy
+context exists, so it cannot affect request activity or lifecycle state.
 
 Route by the configured DNS host after ASCII case folding and removal of one
 optional listener port and a terminal dot. Preserve the request's original

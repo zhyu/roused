@@ -1,6 +1,6 @@
 mod support;
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
@@ -169,6 +169,84 @@ fn routes_two_hosts_and_preserves_http_semantics() {
     assert_eq!(unknown.header("cache-control"), Some("no-store"));
     assert_eq!(unknown.header("content-length"), Some("13"));
     assert_eq!(unknown.body, b"unknown host\n");
+}
+
+#[test]
+fn rejects_tls_client_hello_without_logging_and_keeps_serving_http() {
+    let (request_sender, request_receiver) = mpsc::channel();
+    let upstream = RawServer::spawn(move |mut stream| {
+        let request = read_request(&mut stream).expect("read request after TLS rejection");
+        write_response(
+            &mut stream,
+            "200 OK",
+            [("Connection", "close")],
+            b"plain HTTP still works",
+        )
+        .expect("write response after TLS rejection");
+        request_sender
+            .send(request)
+            .expect("record request after TLS rejection");
+    });
+
+    let upstream_address = upstream.address();
+    let launchd_label = format!(
+        "com.openai.roused.test.tls-rejection.{}",
+        runtime_token("listener")
+    );
+    let proxy = ProxyProcess::spawn_with_stderr_capture(move |listen| {
+        proxy_configuration(
+            listen,
+            &[("plain.apps.test", upstream_address, &launchd_label)],
+        )
+    });
+
+    let marker = runtime_token("tls-client-hello-marker");
+    let mut client_hello = vec![0x16, 0x03, 0x01, 0x00, marker.len() as u8];
+    client_hello.extend_from_slice(marker.as_bytes());
+    let mut tls_client = connect(proxy.address()).expect("connect TLS-speaking client");
+    match tls_client.write_all(&client_hello) {
+        Ok(()) => {
+            if let Err(error) = tls_client.flush() {
+                assert!(
+                    is_connection_close(&error),
+                    "flush TLS ClientHello: {error}"
+                );
+            }
+        }
+        Err(error) => assert!(
+            is_connection_close(&error),
+            "write TLS ClientHello: {error}"
+        ),
+    }
+
+    let mut rejection = Vec::new();
+    if let Err(error) = tls_client.read_to_end(&mut rejection) {
+        assert!(is_connection_close(&error), "read TLS rejection: {error}");
+    }
+    assert!(
+        rejection.is_empty(),
+        "TLS rejection wrote bytes: {rejection:?}"
+    );
+
+    let response = send_request(
+        proxy.address(),
+        b"GET /after-tls HTTP/1.1\r\nHost: plain.apps.test\r\n\r\n",
+    )
+    .expect("send HTTP request after TLS rejection");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"plain HTTP still works");
+    let request = request_receiver
+        .recv_timeout(CHANNEL_TIMEOUT)
+        .expect("upstream received HTTP request after TLS rejection");
+    assert_eq!(request.target, "/after-tls");
+
+    let stderr = proxy.stderr_contents();
+    for unexpected in ["InvalidHTTPHeader", "invalid token", marker.as_str()] {
+        assert!(
+            !stderr.contains(unexpected),
+            "unexpected proxy log: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -892,6 +970,16 @@ fn contains_header_token(value: &str, expected: &str) -> bool {
     value
         .split(',')
         .any(|token| token.trim().eq_ignore_ascii_case(expected))
+}
+
+fn is_connection_close(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::UnexpectedEof
+    )
 }
 
 fn wait_for_proxy_log(proxy: &ProxyProcess, needle: &str) {
