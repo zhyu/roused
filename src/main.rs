@@ -131,6 +131,7 @@ enum CliCommand {
 fn main() -> ExitCode {
     env_logger::Builder::new()
         .filter_level(log::LevelFilter::Info)
+        .format_timestamp_secs()
         .init();
 
     let cli = match Cli::try_parse() {

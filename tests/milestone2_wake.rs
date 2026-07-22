@@ -43,6 +43,11 @@ fn wakes_one_disposable_user_launch_agent_without_replaying_cold_requests() {
     .expect("send request before fixture bootstrap");
     assert_json_loading(&failed_attempt);
     wait_for_proxy_log(&proxy, "launchctl kickstart failed");
+    assert_timestamped_log_entry(
+        &proxy.stderr_contents(),
+        "roused::wake",
+        "launchctl kickstart failed",
+    );
     assert_eq!(launch_attempts(&proxy), 1);
 
     fixture.bootstrap();
@@ -468,6 +473,42 @@ fn wait_for_proxy_log(proxy: &ProxyProcess, needle: &str) {
         );
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn assert_timestamped_log_entry(stderr: &str, target: &str, message: &str) {
+    let line = stderr
+        .lines()
+        .find(|line| line.contains(message))
+        .unwrap_or_else(|| panic!("missing log entry containing {message}: {stderr}"));
+    let (header, _) = line
+        .strip_prefix('[')
+        .and_then(|line| line.split_once("] "))
+        .unwrap_or_else(|| panic!("log entry has no formatted header: {line}"));
+    let mut fields = header.split_ascii_whitespace();
+    let timestamp = fields
+        .next()
+        .unwrap_or_else(|| panic!("log entry has no timestamp: {line}"));
+    assert_utc_timestamp(timestamp);
+    assert_eq!(fields.next(), Some("WARN"), "unexpected log level: {line}");
+    assert_eq!(fields.next(), Some(target), "unexpected log target: {line}");
+    assert_eq!(fields.next(), None, "unexpected log header: {line}");
+}
+
+fn assert_utc_timestamp(timestamp: &str) {
+    assert_eq!(timestamp.len(), 20, "unexpected timestamp: {timestamp}");
+    assert!(
+        timestamp
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                4 | 7 => byte == b'-',
+                10 => byte == b'T',
+                13 | 16 => byte == b':',
+                19 => byte == b'Z',
+                _ => byte.is_ascii_digit(),
+            }),
+        "unexpected timestamp: {timestamp}"
+    );
 }
 
 fn launch_attempts(proxy: &ProxyProcess) -> usize {

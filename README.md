@@ -365,7 +365,9 @@ directory. Deriving the names from the launchd label keeps separately labeled
 gateway instances from sharing log files. Roused's INFO/WARN lifecycle logs—including wake attempts and results,
 stop-check outcomes and timeouts, and target-stop attempts and results—and
 startup diagnostics are written to stderr; stdout is captured separately.
-launchd creates missing log files when it starts the job. The generator
+Runtime log records begin with a UTC RFC 3339 timestamp at second precision,
+followed by the level and module target. launchd creates missing log files when
+it starts the job. The generator
 creates only the selected plist: it does not create directories or log files,
 probe directory writability, bootstrap the job, invoke `launchctl`, or inspect
 or change target plists. Ensure the directory is writable before bootstrapping
