@@ -6,8 +6,8 @@ use pingora::server::configuration::ServerConf;
 use pingora::server::{RunArgs, Server, ShutdownSignal, ShutdownSignalWatch};
 use pingora::services::background::background_service;
 use pingora::services::listening::Service;
-use plain_http::PlainHttpApp;
-use roused::config::Config;
+use plain_http::{PlainHttpApp, TlsHttpApp};
+use roused::config::{Config, TlsConfig};
 use roused::proxy::{GatewayShutdownHandle, RousedProxy};
 use roused::setup::{SetupError, gateway_plist_xml};
 use std::env;
@@ -17,6 +17,7 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -274,8 +275,37 @@ fn write_new(path: &Path, contents: &[u8]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn validate_tls_material(tls: &TlsConfig) -> Result<(), Box<dyn Error>> {
+    let cert = tls
+        .cert()
+        .to_str()
+        .ok_or("tls.cert path must be valid UTF-8")?;
+    let key = tls
+        .key()
+        .to_str()
+        .ok_or("tls.key path must be valid UTF-8")?;
+    let loaded = pingora::tls::load_certs_and_key_files(cert, key)
+        .map_err(|error| format!("cannot load TLS certificate or key: {error}"))?;
+    let Some((certs, key)) = loaded else {
+        return Err("TLS certificate or key file is empty or invalid".into());
+    };
+
+    pingora::tls::install_default_crypto_provider();
+    pingora::tls::ServerConfig::builder_with_protocol_versions(&[
+        &pingora::tls::version::TLS12,
+        &pingora::tls::version::TLS13,
+    ])
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .map_err(|error| format!("TLS certificate and key are invalid: {error}"))?;
+    Ok(())
+}
+
 fn run_gateway(config_path: PathBuf) -> Result<(), Box<dyn Error>> {
     let config = Config::load(&config_path)?;
+    if let Some(tls) = config.tls() {
+        validate_tls_material(tls)?;
+    }
 
     let mut server_config = ServerConf {
         // Pingora treats this field as the total attempt cap, despite its name.
@@ -295,12 +325,31 @@ fn run_gateway(config_path: PathBuf) -> Result<(), Box<dyn Error>> {
     server.bootstrap();
 
     let proxy = pingora::proxy::http_proxy(&server.configuration, proxy);
+    let proxy = Arc::new(proxy);
     let mut service = Service::new(
         "Pingora HTTP Proxy Service".to_owned(),
-        PlainHttpApp::new(proxy),
+        PlainHttpApp::new(Arc::clone(&proxy)),
     );
     service.add_tcp(&listen.to_string());
     server.add_service(service);
+
+    if let Some(tls) = config.tls() {
+        let cert = tls
+            .cert()
+            .to_str()
+            .ok_or("tls.cert path must be valid UTF-8")?;
+        let key = tls
+            .key()
+            .to_str()
+            .ok_or("tls.key path must be valid UTF-8")?;
+        let mut tls_service = Service::new(
+            "Pingora HTTPS Proxy Service".to_owned(),
+            TlsHttpApp::new(Arc::clone(&proxy)),
+        );
+        tls_service.add_tls(&tls.listen().to_string(), cert, key)?;
+        server.add_service(tls_service);
+    }
+
     server.add_service(idle_monitor);
     server.run(RunArgs {
         shutdown_signal: Box::new(GatewayShutdownSignals { shutdown }),

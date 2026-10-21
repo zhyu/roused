@@ -15,10 +15,19 @@ pub struct PlainHttpApp {
 }
 
 impl PlainHttpApp {
-    pub fn new(proxy: HttpProxy<RousedProxy>) -> Self {
-        Self {
-            proxy: Arc::new(proxy),
-        }
+    pub fn new(proxy: Arc<HttpProxy<RousedProxy>>) -> Self {
+        Self { proxy }
+    }
+}
+
+/// Delegates already-terminated TLS streams to Pingora's HTTP parser.
+pub struct TlsHttpApp {
+    proxy: Arc<HttpProxy<RousedProxy>>,
+}
+
+impl TlsHttpApp {
+    pub fn new(proxy: Arc<HttpProxy<RousedProxy>>) -> Self {
+        Self { proxy }
     }
 }
 
@@ -47,6 +56,24 @@ impl ServerApp for PlainHttpApp {
             Ok(Ok(_)) => ServerApp::process_new(&self.proxy, stream, &shutdown).await,
             Ok(Err(_)) | Err(_) => None,
         }
+    }
+
+    async fn cleanup(&self) {
+        ServerApp::cleanup(self.proxy.as_ref()).await;
+    }
+}
+
+#[async_trait]
+impl ServerApp for TlsHttpApp {
+    async fn process_new(
+        self: &Arc<Self>,
+        stream: Stream,
+        shutdown: &ShutdownWatch,
+    ) -> Option<Stream> {
+        if *shutdown.borrow() {
+            return None;
+        }
+        ServerApp::process_new(&self.proxy, stream, shutdown).await
     }
 
     async fn cleanup(&self) {

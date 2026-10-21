@@ -1,19 +1,21 @@
 # Roused
 
 Roused is a macOS activation reverse proxy for lightly used web services. It
-routes plain HTTP/1.1 requests by hostname, wakes an existing current-user
-LaunchAgent when its service is unavailable, proxies requests while the service
-is running, and requests shutdown after the service has been idle long enough.
+routes HTTP/1.1 requests by hostname over plain HTTP or an optional TLS
+listener, wakes an existing current-user LaunchAgent when its service is
+unavailable, proxies requests while the service is running, and requests
+shutdown after the service has been idle long enough.
 
 The bounded MVP is implemented and usable. It is intentionally designed for a
-trusted private network on one macOS host; it does not provide TLS or gateway
-authentication.
+trusted private network on one macOS host; it does not provide gateway
+authentication. TLS is available when the operator supplies a certificate and
+key, but certificate issuance and renewal remain external to Roused.
 
 When a client mistakenly starts a TLS handshake on the plain HTTP listener,
 Roused closes that connection without an HTTP response before request parsing.
 The connection cannot route, wake a target, or reach an upstream. This keeps
 automatic browser HTTPS attempts from producing misleading proxy failures or
-logging the raw ClientHello; it does not provide HTTPS.
+logging the raw ClientHello. Use the optional `[tls]` listener for HTTPS.
 
 ## How it works
 
@@ -43,10 +45,11 @@ Building Roused from source additionally requires Rust/Cargo with Rust 2024
 edition support and CMake. These tools are not required to run a downloaded
 executable.
 
-Roused serves unencrypted HTTP and has no authentication layer of its own.
-Basic, Bearer, cookie, and body-token credentials pass through to the upstream
-in cleartext on the network. Use it only on a deliberately trusted private
-network and never expose it directly to the public internet.
+Roused has no authentication layer of its own. The plain HTTP listener leaves
+Basic, Bearer, cookie, and body-token credentials in cleartext on the network;
+the optional TLS listener protects transport only. Use Roused only on a
+deliberately trusted private network and never expose it directly to the public
+internet.
 
 ## Install a nightly build
 
@@ -127,6 +130,20 @@ launchd:
 roused check-config /absolute/path/to/roused.toml
 ```
 
+To serve HTTPS, add one certificate/key pair covering all configured hosts:
+
+```toml
+[tls]
+listen = "0.0.0.0:8443"
+cert = "/absolute/path/to/fullchain.pem"
+key = "/absolute/path/to/privkey.pem"
+```
+
+The plain `listen` socket remains available. Roused validates the certificate
+and matching private key before binding either listener, and uses the same
+routes on both. There is no automatic certificate management or reload;
+replacing certificate files requires restarting Roused.
+
 Run Roused in the foreground:
 
 ```sh
@@ -167,8 +184,11 @@ status 2. Both generation commands refuse to overwrite an existing output.
 
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `listen` | yes | Literal IP socket for the gateway, using port 1024 or higher. |
-| `services[].host` | yes | ASCII DNS hostname without a port. Matching is case-insensitive and accepts one terminal dot or the configured listener port on requests. |
+| `listen` | yes | Literal IP socket for the plain HTTP listener, using port 1024 or higher. |
+| `tls.listen` | with `[tls]` | Literal IP socket for the HTTPS listener, using a different port 1024 or higher. |
+| `tls.cert` | with `[tls]` | Absolute path to a PEM certificate chain. |
+| `tls.key` | with `[tls]` | Absolute path to the matching PEM private key. |
+| `services[].host` | yes | ASCII DNS hostname without a port. Matching is case-insensitive and accepts one terminal dot or the connection's listener port on requests. |
 | `services[].upstream` | yes | Literal loopback IP socket with a nonzero port. |
 | `services[].launchd_label` | yes | Label of an already-bootstrapped job in `gui/$UID`. |
 | `services[].idle_timeout_seconds` | no | Nonzero idle interval; defaults to 1,800 seconds. |
@@ -178,6 +198,14 @@ At least one service is required. Normalized hosts, upstreams, and launchd
 labels must be unique. Unknown fields and any invalid entry reject the entire
 configuration.
 
+`[tls]` is optional. When present, Roused opens both the plain HTTP listener
+and the TLS listener and serves the same routes on both. The certificate must
+cover every configured hostname; Roused loads exactly one certificate/key pair
+and does not select certificates by SNI. Certificate and key paths must be
+absolute, and their contents are validated before either listener binds. The
+files are loaded only at startup, so certificate renewal requires restarting
+Roused.
+
 Roused accepts launchd labels, never target plist paths. Neither startup nor
 `check-config` inspects a target's plist or proves that its job exists. A
 missing label, a job that was not bootstrapped, or a service listening at the
@@ -186,17 +214,38 @@ receiving `503` responses.
 
 ## Request and wake behavior
 
-Only plain HTTP/1.1 reaches request routing. A connection whose initial bytes
+The plain HTTP listener accepts HTTP/1.1. A connection whose initial bytes
 identify a TLS ClientHello is closed without an HTTP response or TLS alert,
 before Roused parses a request or selects a service. The client may then fall
 back to HTTP according to its own policy.
 
-Roused routes the HTTP `Host` header. A malformed or unconfigured host receives:
+The optional TLS listener terminates HTTPS with the configured certificate,
+then sends the decrypted HTTP/1.1 request through the same routing and proxy
+path. HTTP/2 and HTTP/3 are not enabled. TLS material is loaded when Roused
+starts; there is no live reload.
+
+Roused routes the HTTP `Host` header. A port in `Host`, when present, must equal
+the port that accepted the connection. This lets the plain and TLS listeners
+share routes while still rejecting a request addressed to the wrong listener.
+The original `Host` is preserved upstream. A malformed or unconfigured host
+receives:
 
 - `421 Misdirected Request`;
 - `Content-Type: text/plain; charset=utf-8`;
 - `Cache-Control: no-store`; and
 - body `unknown host\n`.
+
+On the TLS listener, Roused removes any inbound `Forwarded`,
+`X-Forwarded-*`, and `X-Real-IP` fields, then sets:
+
+- `X-Forwarded-Proto: https`;
+- `X-Forwarded-For` and `X-Real-IP` to the peer address;
+- `X-Forwarded-Host` to the original `Host`; and
+- `X-Forwarded-Port` to the local listener port.
+
+On the plain HTTP listener those inbound forwarding fields are removed and not
+replaced. X-Forwarded-Prefix is never synthesized; Roused does not support URL
+prefixes.
 
 For a ready service, Roused preserves methods, paths and queries, the original
 `Host`, request and response streaming, upstream-owned authentication and
@@ -401,9 +450,10 @@ gateway operations needs `sudo` or writes under `/Library`.
 | Symptom | Check |
 | --- | --- |
 | Repeated `503` responses | Confirm the target job is bootstrapped in `gui/$UID`, its label matches the configuration, and it listens on the configured loopback socket after kickstart. |
-| `421 Misdirected Request` | Confirm the request `Host` matches `services[].host`; an included port must equal the Roused listener port. |
-| An HTTPS URL closes without a response | This is the expected rejection on the plain HTTP listener. Use an explicit `http://` URL; Roused does not terminate TLS. |
-| A configuration edit has no effect | Restart Roused; configuration is loaded only at startup. A restart performs the normal bounded target cleanup first. |
+| `421 Misdirected Request` | Confirm the request `Host` matches `services[].host`; an included port must equal the local listener port that accepted the connection. |
+| An HTTPS URL closes without a response | A TLS ClientHello reached the plain HTTP listener. Use the configured `[tls].listen` port. |
+| TLS startup fails | Confirm `tls.cert` and `tls.key` are absolute paths, the key matches the certificate, and the certificate covers every configured hostname. |
+| A configuration or certificate edit has no effect | Restart Roused; configuration and TLS material are loaded only at startup. A restart performs the normal bounded target cleanup first. |
 | A target never stops | Check for active requests or WebSockets, a vetoed/failed stop command, a target that ignores `SIGTERM`, or an incompatible launchd `KeepAlive` policy. |
 | The gateway does not start under launchd | Inspect `$HOME/Library/Logs/<label>.stderr.log` (or the selected override) and confirm that the log directory existed and was writable before bootstrapping the plist. |
 
@@ -413,21 +463,22 @@ headers, response headers, credentials, or checker argv.
 ## Current limitations
 
 - macOS and current-user `gui/$UID` LaunchAgents only;
-- plain HTTP/1.1 only—TLS ClientHello connections are closed without a response,
-  and there is no TLS termination, HTTP/2, HTTP/3, or public-access hardening;
-- no gateway authentication, rate limits, body-size policy, or CORS policy;
+- HTTP/1.1 only, over plain HTTP or optional TLS; there is no HTTP/2 or HTTP/3,
+  public-access hardening, or gateway authentication;
+- one operator-supplied TLS certificate/key pair with no ACME client, SNI
+  certificate selection, client-certificate authentication, or hot reload;
+- no rate limits, body-size policy, or CORS policy;
 - no configuration reload, persistent lifecycle state, host aliases,
   dashboard, admin API, or metrics;
 - no target plist installation, discovery, inspection, editing, or repair;
 - no direct target-process supervision or arbitrary target command execution;
-- no `Forwarded`/`X-Forwarded-*` synthesis, cookie rewriting, or redirect
-  rewriting; and
+- no cookie or redirect rewriting, and no URL-prefix support; and
 - no support guarantee for Server-Sent Events.
 
-Roused preserves upstream `Secure` cookie attributes. Browsers generally do
-not store or send those cookies over this cleartext gateway, so services that
-require HTTPS or `Secure` cookies are not compatible. Dependency DEBUG/TRACE
-logging is unsupported because it may expose authentication or other headers.
+Roused preserves upstream `Secure` cookie attributes. Services that require
+HTTPS or `Secure` cookies are compatible only when clients use the TLS listener
+and the service is configured for that origin. Dependency DEBUG/TRACE logging
+is unsupported because it may expose authentication or other headers.
 
 ## Development and verification
 

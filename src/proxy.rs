@@ -14,6 +14,7 @@ use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::prelude::{Error, HttpPeer, InternalError, Result};
 use pingora::proxy::{ProxyHttp, Session};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,7 +24,7 @@ const LOADING_HTML_BODY: &[u8] = b"<!doctype html><html><head><meta charset=\"ut
 const LOADING_JSON_BODY: &[u8] = b"{\"status\":\"loading\",\"retry_after\":5}\n";
 
 pub struct RousedProxy {
-    listener_port: u16,
+    plain_listener_port: u16,
     routes: HashMap<String, Arc<ServiceRoute>>,
     idle_monitor: IdleMonitor,
     request_gate: Arc<RequestGate>,
@@ -51,6 +52,9 @@ pub struct RequestContext {
     admission: Option<RequestAdmission>,
     rejected_for_shutdown: bool,
     websocket: bool,
+    listener_port: u16,
+    tls: bool,
+    peer_ip: Option<IpAddr>,
 }
 
 struct ServiceRoute {
@@ -87,7 +91,7 @@ impl RousedProxy {
             })
             .collect();
         Self {
-            listener_port: config.listen().port(),
+            plain_listener_port: config.listen().port(),
             routes,
             idle_monitor: IdleMonitor::new(
                 lifecycles,
@@ -124,6 +128,9 @@ impl ProxyHttp for RousedProxy {
             rejected_for_shutdown: admission.is_none(),
             admission,
             websocket: false,
+            listener_port: self.plain_listener_port,
+            tls: false,
+            peer_ip: None,
         }
     }
 
@@ -133,12 +140,17 @@ impl ProxyHttp for RousedProxy {
             return Ok(true);
         }
         context.websocket = is_valid_websocket_request(session.req_header());
+        let (local_port, tls, peer_ip) = request_transport(session);
+        context.listener_port = local_port.unwrap_or(self.plain_listener_port);
+        context.tls = tls;
+        context.peer_ip = peer_ip;
+
         let route = session
             .req_header()
             .headers
             .get(HOST)
             .and_then(|host| host.to_str().ok())
-            .and_then(|host| normalize_request_host(host, self.listener_port))
+            .and_then(|host| normalize_request_host(host, context.listener_port))
             .and_then(|host| self.routes.get(&host).cloned());
 
         let Some(route) = route else {
@@ -200,6 +212,7 @@ impl ProxyHttp for RousedProxy {
         context: &mut Self::CTX,
     ) -> Result<()> {
         strip_request_hop_headers(upstream_request, context.websocket);
+        apply_forwarded_headers(upstream_request, context)?;
 
         // Pingora reads the downstream body incrementally, but after removing the
         // inbound framing header it needs explicit H1 framing for the upstream.
@@ -305,6 +318,57 @@ async fn write_loading_response(session: &mut Session) -> Result<()> {
             .write_response_body(Some(Bytes::from_static(body)), true)
             .await
     }
+}
+
+fn apply_forwarded_headers(request: &mut RequestHeader, context: &RequestContext) -> Result<()> {
+    for name in [
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-port",
+        "x-forwarded-prefix",
+        "x-forwarded-proto",
+        "x-real-ip",
+    ] {
+        request.remove_header(name);
+    }
+
+    if !context.tls {
+        return Ok(());
+    }
+
+    request.insert_header("X-Forwarded-Proto", "https")?;
+    if let Some(peer_ip) = context.peer_ip {
+        let peer_ip = peer_ip.to_string();
+        request.insert_header("X-Forwarded-For", peer_ip.as_str())?;
+        request.insert_header("X-Real-IP", peer_ip.as_str())?;
+    }
+    if let Some(host) = request
+        .headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+    {
+        request.insert_header("X-Forwarded-Host", host.as_str())?;
+    }
+    request.insert_header("X-Forwarded-Port", context.listener_port.to_string())?;
+    Ok(())
+}
+
+fn request_transport(session: &Session) -> (Option<u16>, bool, Option<IpAddr>) {
+    let Some(digest) = session.digest() else {
+        return (None, false, None);
+    };
+    let socket = digest.socket_digest.as_ref();
+    let local_port = socket
+        .and_then(|socket| socket.local_addr())
+        .and_then(|addr| addr.as_inet())
+        .map(|addr| addr.port());
+    let peer_ip = socket
+        .and_then(|socket| socket.peer_addr())
+        .and_then(|addr| addr.as_inet())
+        .map(|addr| addr.ip());
+    (local_port, digest.ssl_digest.is_some(), peer_ip)
 }
 
 fn prefers_html_loading(request: &RequestHeader) -> bool {
@@ -458,6 +522,74 @@ fn strip_response_hop_headers(response: &mut ResponseHeader, retain_upgrade: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tls_forwarded_headers_replace_spoofed_values() {
+        let mut request = RequestHeader::build("GET", b"/", Some(24)).unwrap();
+        request.insert_header(HOST, "stash.apps.test:8443").unwrap();
+        request
+            .insert_header("Forwarded", "for=203.0.113.9")
+            .unwrap();
+        request.insert_header("X-Forwarded-Proto", "http").unwrap();
+        request
+            .insert_header("X-Forwarded-For", "203.0.113.9")
+            .unwrap();
+        request.insert_header("X-Real-IP", "203.0.113.9").unwrap();
+        let context = RequestContext {
+            route: None,
+            lease: None,
+            admission: None,
+            rejected_for_shutdown: false,
+            websocket: false,
+            listener_port: 8443,
+            tls: true,
+            peer_ip: Some("192.0.2.10".parse().unwrap()),
+        };
+
+        apply_forwarded_headers(&mut request, &context).unwrap();
+
+        assert_eq!(request.headers[HOST], "stash.apps.test:8443");
+        assert_eq!(request.headers["x-forwarded-proto"], "https");
+        assert_eq!(request.headers["x-forwarded-for"], "192.0.2.10");
+        assert_eq!(request.headers["x-real-ip"], "192.0.2.10");
+        assert_eq!(request.headers["x-forwarded-host"], "stash.apps.test:8443");
+        assert_eq!(request.headers["x-forwarded-port"], "8443");
+        assert!(!request.headers.contains_key("forwarded"));
+    }
+
+    #[test]
+    fn plaintext_forwarded_headers_are_removed() {
+        let mut request = RequestHeader::build("GET", b"/", Some(24)).unwrap();
+        request.insert_header(HOST, "stash.apps.test:8080").unwrap();
+        request.insert_header("X-Forwarded-Proto", "https").unwrap();
+        request
+            .insert_header("X-Forwarded-For", "203.0.113.9")
+            .unwrap();
+        request.insert_header("X-Real-IP", "203.0.113.9").unwrap();
+        let context = RequestContext {
+            route: None,
+            lease: None,
+            admission: None,
+            rejected_for_shutdown: false,
+            websocket: false,
+            listener_port: 8080,
+            tls: false,
+            peer_ip: Some("192.0.2.10".parse().unwrap()),
+        };
+
+        apply_forwarded_headers(&mut request, &context).unwrap();
+
+        assert_eq!(request.headers[HOST], "stash.apps.test:8080");
+        for name in [
+            "x-forwarded-proto",
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-port",
+            "x-real-ip",
+        ] {
+            assert!(!request.headers.contains_key(name), "{name}");
+        }
+    }
 
     #[test]
     fn ordinary_request_removes_bounded_and_connection_named_headers() {

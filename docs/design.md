@@ -2,6 +2,8 @@
 
 Date fixed: 2026-07-18
 
+Optional TLS listener added: 2026-10-21.
+
 ## Product contract
 
 Roused is an HTTP-aware activation proxy for native services on one macOS home
@@ -25,7 +27,7 @@ in order. Milestone 1 is only the proxy for already-running fixtures.
 Use one direct implementation against exactly Pingora 0.8.1:
 
 ```toml
-pingora = { version = "=0.8.1", default-features = false, features = ["proxy"] }
+pingora = { version = "=0.8.1", default-features = false, features = ["proxy", "rustls"] }
 ```
 
 Commit `Cargo.lock`. Do not build a proxy-engine abstraction or maintain a
@@ -34,20 +36,28 @@ HTTP, streaming responses, client aborts, and a WebSocket echo/lifetime check.
 Pingora also passed the local SSE experiment, but an upstream macOS SSE report
 remains open; SSE is therefore not supported or investigated by this MVP.
 
-The gateway exposes configurable, unprivileged plain HTTP/1.1. There is no
-port 80 requirement, TLS provider, certificate handling, HTTP/2, or HTTP/3.
-Before HTTP parsing, a raw TCP connection whose initial bytes identify a TLS
-ClientHello is closed without an HTTP response or TLS alert. It must not enter
-routing, wake a target, contact an upstream, or log the ClientHello. This is a
-wrong-protocol rejection, not TLS support.
+The gateway exposes configurable, unprivileged HTTP/1.1. TLS termination is
+optional and uses one operator-supplied certificate/key pair loaded at startup;
+Roused has no ACME client, certificate management, SNI certificate selection,
+or hot reload. HTTP/2 and HTTP/3 are not enabled. On the plain listener, a raw
+TCP connection whose initial bytes identify a TLS ClientHello is closed without
+an HTTP response or TLS alert. It must not enter routing, wake a target, contact
+an upstream, or log the ClientHello. This is a wrong-protocol rejection, not TLS
+support.
 
 ## Configuration contract
 
 Configuration is static TOML and is validated atomically before the listener
-starts. The target shape is:
+starts. Optional TLS certificate material is parsed and matched before either
+listener binds. The target shape is:
 
 ```toml
 listen = "0.0.0.0:8080"
+
+[tls]
+listen = "0.0.0.0:8443"
+cert = "/absolute/path/to/fullchain.pem"
+key = "/absolute/path/to/privkey.pem"
 
 [[services]]
 host = "aria2.apps.home.arpa"
@@ -58,10 +68,18 @@ can_stop_command = ["/absolute/path/to/aria2-can-stop"]
 ```
 
 `can_stop_command` is optional and the idle timeout defaults to 1,800 seconds.
+`[tls]` is optional. When present, it requires a literal IP socket on a
+different unprivileged port from `listen`, plus absolute certificate and key
+paths. Roused validates that the PEM certificate chain and private key parse
+and match before binding either listener. It does not validate certificate
+hostnames against configured services, and it does not support more than one
+certificate/key pair.
+
 Reject unknown keys, duplicate normalized hosts, duplicate labels or
 upstreams, non-loopback upstreams, invalid launchd labels, zero idle timeouts,
-and an empty command or non-absolute command executable. One service entry
-represents one host, launchd job, and upstream; aliases are not supported.
+an empty command or non-absolute command executable, and invalid or incomplete
+TLS configuration. One service entry represents one host, launchd job, and
+upstream; aliases are not supported.
 
 The lifecycle fields are parsed in Milestone 1 so the configuration format is
 stable, but they must not trigger launchd or idle behavior until their named
@@ -123,14 +141,19 @@ directory must be writable before bootstrapping.
 
 ## Routing and proxy semantics
 
-Only a successfully parsed plain HTTP/1.1 request enters proxy semantics. TLS
-ClientHello rejection happens at the connection boundary before a proxy
-context exists, so it cannot affect request activity or lifecycle state.
+Only a successfully parsed HTTP/1.1 request enters proxy semantics. On the
+plain listener, TLS ClientHello rejection happens at the connection boundary
+before a proxy context exists, so it cannot affect request activity or
+lifecycle state. The optional TLS listener terminates HTTPS and then enters the
+same proxy path.
 
 Route by the configured DNS host after ASCII case folding and removal of one
-optional listener port and a terminal dot. Preserve the request's original
-`Host` value upstream. All upstreams are static loopback HTTP addresses.
-Unknown hosts receive one deterministic documented response.
+optional port equal to the local listener port and a terminal dot. The local
+port comes from the accepted socket, not from a single global listen setting,
+so a plain listener and a TLS listener can coexist. Preserve the request's
+original `Host` value upstream, including a non-default port. All upstreams are
+static loopback HTTP addresses. Unknown hosts receive one deterministic
+documented response.
 
 The transparency contract is semantic HTTP transparency, not byte-for-byte
 wire identity:
@@ -149,14 +172,32 @@ wire identity:
 - configure and regression-test exactly one total upstream attempt so a POST
   or JSON-RPC call is never submitted twice.
 
+### TLS and forwarding headers
+
+Forwarding fields are connection metadata, not end-to-end client data. Remove
+any inbound `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`,
+`X-Forwarded-Port`, `X-Forwarded-Prefix`, `X-Forwarded-Proto`, and `X-Real-IP`
+fields before proxying.
+
+On a TLS listener, synthesize:
+
+- `X-Forwarded-Proto: https`;
+- `X-Forwarded-For` and `X-Real-IP` from the accepted socket peer;
+- `X-Forwarded-Host` from the original `Host`; and
+- `X-Forwarded-Port` from the local listener port.
+
+On the plain listener, do not synthesize those fields. In particular, never
+claim `https` for a plaintext connection. Do not synthesize `Forwarded` or
+`X-Forwarded-Prefix`.
+
 The gateway has no authentication layer of its own. Basic, Bearer, cookie, and
 body-token authentication belong to the upstream and must pass through. Never
 log request or response headers at supported INFO logging. Pingora dependency
 DEBUG/TRACE may expose headers and must not be enabled with real credentials.
 
-Plain HTTP leaves credentials unencrypted on the LAN. Preserve `Secure` cookie
-attributes rather than weakening or rewriting them; services requiring HTTPS
-or Secure cookies are outside the MVP.
+Plain HTTP leaves credentials unencrypted on the LAN. TLS protects transport
+only. Preserve `Secure` cookie attributes rather than weakening or rewriting
+them; services requiring HTTPS must be used through the TLS listener.
 
 ## WebSocket contract
 
@@ -261,9 +302,10 @@ and bootstraps it manually. The MVP never uses root, sudo, a privileged broker,
 - native HTTP/JSON-RPC stop-check adapters;
 - SSE support or investigation;
 - config reload, persistence, aliases, dashboard, admin API, or metrics;
-- gateway-owned authentication, TLS, certificate management, or public access;
-- rate limits, body-size or CORS policy, `Forwarded`/`X-Forwarded-*`
-  synthesis, and cookie or redirect rewriting;
+- gateway-owned authentication, certificate issuance or renewal, SNI
+  certificate selection, HTTP/2 or HTTP/3, or public-access hardening;
+- rate limits, body-size or CORS policy, `Forwarded` synthesis,
+  `X-Forwarded-Prefix`, and cookie or redirect rewriting;
 - target-specific graceful drain protocols, SIGKILL escalation, PID discovery,
   and repair of a target's restart policy; and
 - broad launchd, security, performance, or proxy-conformance audits.

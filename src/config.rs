@@ -13,7 +13,17 @@ const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 1_800;
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     listen: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls: Option<RawTls>,
     services: Vec<RawService>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawTls {
+    listen: String,
+    cert: String,
+    key: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -35,7 +45,15 @@ fn default_idle_timeout_seconds() -> u64 {
 #[derive(Debug)]
 pub struct Config {
     listen: SocketAddr,
+    tls: Option<TlsConfig>,
     services: BTreeMap<String, ServiceConfig>,
+}
+
+#[derive(Debug)]
+pub struct TlsConfig {
+    listen: SocketAddr,
+    cert: PathBuf,
+    key: PathBuf,
 }
 
 #[derive(Debug)]
@@ -51,6 +69,7 @@ impl Config {
     pub fn starter_toml() -> Result<String, toml::ser::Error> {
         let starter = RawConfig {
             listen: "0.0.0.0:8080".into(),
+            tls: None,
             services: vec![
                 RawService {
                     host: "first-service.apps.home.arpa".into(),
@@ -89,6 +108,44 @@ impl Config {
                 "listen must use a fixed unprivileged port (1024 or greater)".into(),
             ));
         }
+
+        let tls = raw
+            .tls
+            .map(|raw_tls| {
+                let tls_listen = raw_tls.listen.parse::<SocketAddr>().map_err(|_| {
+                    ConfigError::Invalid("tls.listen must be a literal IP socket address".into())
+                })?;
+                if tls_listen.port() < 1_024 {
+                    return Err(ConfigError::Invalid(
+                        "tls.listen must use a fixed unprivileged port (1024 or greater)".into(),
+                    ));
+                }
+                if tls_listen.port() == listen.port() {
+                    return Err(ConfigError::Invalid(
+                        "tls.listen must use a different port from listen".into(),
+                    ));
+                }
+
+                let cert = PathBuf::from(raw_tls.cert);
+                if !cert.is_absolute() {
+                    return Err(ConfigError::Invalid(
+                        "tls.cert must be an absolute path".into(),
+                    ));
+                }
+                let key = PathBuf::from(raw_tls.key);
+                if !key.is_absolute() {
+                    return Err(ConfigError::Invalid(
+                        "tls.key must be an absolute path".into(),
+                    ));
+                }
+
+                Ok(TlsConfig {
+                    listen: tls_listen,
+                    cert,
+                    key,
+                })
+            })
+            .transpose()?;
 
         if raw.services.is_empty() {
             return Err(ConfigError::Invalid(
@@ -159,11 +216,19 @@ impl Config {
             );
         }
 
-        Ok(Self { listen, services })
+        Ok(Self {
+            listen,
+            tls,
+            services,
+        })
     }
 
     pub fn listen(&self) -> SocketAddr {
         self.listen
+    }
+
+    pub fn tls(&self) -> Option<&TlsConfig> {
+        self.tls.as_ref()
     }
 
     pub fn services(&self) -> impl Iterator<Item = &ServiceConfig> {
@@ -173,6 +238,20 @@ impl Config {
     pub fn service_for_request_host(&self, host: &str) -> Option<&ServiceConfig> {
         let host = normalize_request_host(host, self.listen.port())?;
         self.services.get(&host)
+    }
+}
+
+impl TlsConfig {
+    pub fn listen(&self) -> SocketAddr {
+        self.listen
+    }
+
+    pub fn cert(&self) -> &Path {
+        &self.cert
+    }
+
+    pub fn key(&self) -> &Path {
+        &self.key
     }
 }
 
@@ -317,6 +396,20 @@ upstream = "127.0.0.1:9001"
 launchd_label = "net.test.alpha"
 "#;
 
+    const VALID_TLS: &str = r#"
+listen = "127.0.0.1:8080"
+
+[tls]
+listen = "127.0.0.1:8443"
+cert = "/tmp/roused-test.crt"
+key = "/tmp/roused-test.key"
+
+[[services]]
+host = "alpha.apps.test"
+upstream = "127.0.0.1:9001"
+launchd_label = "net.test.alpha"
+"#;
+
     fn error(input: &str) -> String {
         Config::from_toml(input).unwrap_err().to_string()
     }
@@ -334,11 +427,45 @@ launchd_label = "net.test.alpha"
     }
 
     #[test]
+    fn parses_optional_tls_listener() {
+        let config = Config::from_toml(VALID_TLS).unwrap();
+        let tls = config.tls().expect("TLS section");
+        assert_eq!(tls.listen(), "127.0.0.1:8443".parse().unwrap());
+        assert_eq!(tls.cert(), Path::new("/tmp/roused-test.crt"));
+        assert_eq!(tls.key(), Path::new("/tmp/roused-test.key"));
+        assert!(Config::from_toml(VALID).unwrap().tls().is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_tls_paths_ports_and_fields() {
+        for (from, to) in [
+            ("/tmp/roused-test.crt", "relative.crt"),
+            ("/tmp/roused-test.key", "relative.key"),
+        ] {
+            assert!(
+                error(&VALID_TLS.replace(from, to)).contains("tls."),
+                "expected TLS path rejection for {to}"
+            );
+        }
+        assert!(
+            error(&VALID_TLS.replace("127.0.0.1:8443", "127.0.0.1:8080"))
+                .contains("different port")
+        );
+        assert!(
+            error(&VALID_TLS.replace("[tls]\n", "[tls]\nextra = true\n")).contains("unknown field")
+        );
+        assert!(
+            error(&VALID_TLS.replace("key =", "extra = true\nkey =")).contains("unknown field")
+        );
+    }
+
+    #[test]
     fn starter_toml_is_deterministic_and_round_trips_with_two_services() {
         let first = Config::starter_toml().unwrap();
         let second = Config::starter_toml().unwrap();
         assert_eq!(first, second);
         assert_eq!(first.matches("[[services]]").count(), 2);
+        assert!(!first.contains("[tls]"));
 
         let config = Config::from_toml(&first).unwrap();
         let services = config.services().collect::<Vec<_>>();
