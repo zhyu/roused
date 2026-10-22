@@ -123,8 +123,10 @@ entries configure routing; they do not create or install target services.
 
 Set `listen` to `0.0.0.0:<port>` to accept cleartext connections on every IPv4
 interface, or use `127.0.0.1:<port>` if only local clients should reach the
-gateway. Then validate the complete file without starting Roused or touching
-launchd:
+gateway. A port below 1024 is accepted only on a wildcard address (`0.0.0.0` or
+`::`): macOS permits that bind without root, while a specific address such as
+`127.0.0.1:443` still requires root and is rejected before listening. Then
+validate the complete file without starting Roused or touching launchd:
 
 ```sh
 roused check-config /absolute/path/to/roused.toml
@@ -184,8 +186,8 @@ status 2. Both generation commands refuse to overwrite an existing output.
 
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `listen` | yes | Literal IP socket for the plain HTTP listener, using port 1024 or higher. |
-| `tls.listen` | with `[tls]` | Literal IP socket for the HTTPS listener, using a different port 1024 or higher. |
+| `listen` | yes | Literal IP socket for the plain HTTP listener. A port below 1024 requires a wildcard address (`0.0.0.0` or `::`). |
+| `tls.listen` | with `[tls]` | Literal IP socket for the HTTPS listener, using a different port. A port below 1024 requires a wildcard address (`0.0.0.0` or `::`). |
 | `tls.cert` | with `[tls]` | Absolute path to a PEM certificate chain. |
 | `tls.key` | with `[tls]` | Absolute path to the matching PEM private key. |
 | `services[].host` | yes | ASCII DNS hostname without a port. Matching is case-insensitive and accepts one terminal dot or the connection's listener port on requests. |
@@ -453,6 +455,7 @@ gateway operations needs `sudo` or writes under `/Library`.
 | `421 Misdirected Request` | Confirm the request `Host` matches `services[].host`; an included port must equal the local listener port that accepted the connection. |
 | An HTTPS URL closes without a response | A TLS ClientHello reached the plain HTTP listener. Use the configured `[tls].listen` port. |
 | TLS startup fails | Confirm `tls.cert` and `tls.key` are absolute paths, the key matches the certificate, and the certificate covers every configured hostname. |
+| A privileged port fails to bind | Use a wildcard address (`0.0.0.0` or `::`); macOS requires root for a port below 1024 on a specific interface. |
 | A configuration or certificate edit has no effect | Restart Roused; configuration and TLS material are loaded only at startup. A restart performs the normal bounded target cleanup first. |
 | A target never stops | Check for active requests or WebSockets, a vetoed/failed stop command, a target that ignores `SIGTERM`, or an incompatible launchd `KeepAlive` policy. |
 | The gateway does not start under launchd | Inspect `$HOME/Library/Logs/<label>.stderr.log` (or the selected override) and confirm that the log directory existed and was writable before bootstrapping the plist. |

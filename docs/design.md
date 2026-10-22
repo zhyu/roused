@@ -36,7 +36,10 @@ HTTP, streaming responses, client aborts, and a WebSocket echo/lifetime check.
 Pingora also passed the local SSE experiment, but an upstream macOS SSE report
 remains open; SSE is therefore not supported or investigated by this MVP.
 
-The gateway exposes configurable, unprivileged HTTP/1.1. TLS termination is
+The gateway exposes configurable HTTP/1.1 from an unprivileged current-user
+LaunchAgent. A port below 1024 is accepted only on a wildcard address, which
+macOS permits without root; binding a specific interface still requires root
+and is rejected before listening. TLS termination is
 optional and uses one operator-supplied certificate/key pair loaded at startup;
 Roused has no ACME client, certificate management, SNI certificate selection,
 or hot reload. HTTP/2 and HTTP/3 are not enabled. On the plain listener, a raw
@@ -69,9 +72,10 @@ can_stop_command = ["/absolute/path/to/aria2-can-stop"]
 
 `can_stop_command` is optional and the idle timeout defaults to 1,800 seconds.
 `[tls]` is optional. When present, it requires a literal IP socket on a
-different unprivileged port from `listen`, plus absolute certificate and key
-paths. Roused validates that the PEM certificate chain and private key parse
-and match before binding either listener. It does not validate certificate
+different port from `listen`, plus absolute certificate and key paths. A port
+below 1024 requires a wildcard address on both listeners. Roused validates
+that the PEM certificate chain and private key parse and match before binding
+either listener. It does not validate certificate
 hostnames against configured services, and it does not support more than one
 certificate/key pair.
 

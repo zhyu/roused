@@ -103,11 +103,7 @@ impl Config {
         let listen = raw.listen.parse::<SocketAddr>().map_err(|_| {
             ConfigError::Invalid("listen must be a literal IP socket address".into())
         })?;
-        if listen.port() < 1_024 {
-            return Err(ConfigError::Invalid(
-                "listen must use a fixed unprivileged port (1024 or greater)".into(),
-            ));
-        }
+        validate_listener(listen, "listen")?;
 
         let tls = raw
             .tls
@@ -115,11 +111,7 @@ impl Config {
                 let tls_listen = raw_tls.listen.parse::<SocketAddr>().map_err(|_| {
                     ConfigError::Invalid("tls.listen must be a literal IP socket address".into())
                 })?;
-                if tls_listen.port() < 1_024 {
-                    return Err(ConfigError::Invalid(
-                        "tls.listen must use a fixed unprivileged port (1024 or greater)".into(),
-                    ));
-                }
+                validate_listener(tls_listen, "tls.listen")?;
                 if tls_listen.port() == listen.port() {
                     return Err(ConfigError::Invalid(
                         "tls.listen must use a different port from listen".into(),
@@ -291,6 +283,25 @@ fn validate_command(command: Option<&[String]>, service_number: usize) -> Result
             "service {service_number} can_stop_command executable must be an absolute path"
         )));
     }
+    Ok(())
+}
+
+fn validate_listener(address: SocketAddr, field: &'static str) -> Result<(), ConfigError> {
+    if address.port() == 0 {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must use a fixed nonzero port"
+        )));
+    }
+
+    // macOS permits an unprivileged bind below 1024 only on a wildcard
+    // address. A specific interface still requires root, which Roused does not
+    // use, so reject it before attempting to listen.
+    if address.port() < 1_024 && !address.ip().is_unspecified() {
+        return Err(ConfigError::Invalid(format!(
+            "{field} below 1024 requires a wildcard bind address (0.0.0.0 or ::) on macOS"
+        )));
+    }
+
     Ok(())
 }
 
@@ -501,8 +512,9 @@ launchd_label = "net.test.alpha"
     #[test]
     fn rejects_malformed_or_nonloopback_addresses() {
         assert!(error(&VALID.replace("127.0.0.1:8080", "localhost:8080")).contains("listen"));
-        for listen in ["127.0.0.1:0", "127.0.0.1:80"] {
-            assert!(error(&VALID.replace("127.0.0.1:8080", listen)).contains("unprivileged"));
+        assert!(error(&VALID.replace("127.0.0.1:8080", "127.0.0.1:0")).contains("nonzero port"));
+        for listen in ["127.0.0.1:80", "127.0.0.1:443", "[::1]:443"] {
+            assert!(error(&VALID.replace("127.0.0.1:8080", listen)).contains("wildcard"));
         }
         for upstream in [
             "localhost:9001",
@@ -513,6 +525,26 @@ launchd_label = "net.test.alpha"
             assert!(error(&VALID.replace("127.0.0.1:9001", upstream)).contains("upstream"));
         }
         assert!(Config::from_toml(&VALID.replace("127.0.0.1:9001", "[::1]:9001")).is_ok());
+    }
+
+    #[test]
+    fn allows_privileged_ports_only_on_a_wildcard_address() {
+        for listen in ["0.0.0.0:80", "0.0.0.0:443", "[::]:80", "[::]:443"] {
+            let config = Config::from_toml(&VALID.replace("127.0.0.1:8080", listen)).unwrap();
+            assert_eq!(config.listen(), listen.parse::<SocketAddr>().unwrap());
+        }
+
+        let tls = VALID_TLS
+            .replace("127.0.0.1:8080", "0.0.0.0:80")
+            .replace("127.0.0.1:8443", "0.0.0.0:443");
+        let config = Config::from_toml(&tls).unwrap();
+        assert_eq!(config.listen(), "0.0.0.0:80".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            config.tls().unwrap().listen(),
+            "0.0.0.0:443".parse::<SocketAddr>().unwrap()
+        );
+
+        assert!(error(&VALID_TLS.replace("127.0.0.1:8443", "127.0.0.1:443")).contains("wildcard"));
     }
 
     #[test]
